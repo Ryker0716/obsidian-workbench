@@ -1,0 +1,14 @@
+# Obsidian 运行时产物（个人的插件配置，绝不要提交）
+data.json
+workspace.json
+workspace-mobile.json
+cache/
+
+# 依赖（本项目零依赖，跑测试也不需要装包）
+node_modules/
+
+# 编辑器 / 系统
+.DS_Store
+.vscode/
+.idea/
+*.log
