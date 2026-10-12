@@ -1,5 +1,7 @@
 # 工作台（Workbench）
 
+[中文](README.md) | [English](README.en.md)
+
 一个 Obsidian 插件：**统计会议次数、汇总会议行动项、管理未来工作安排**，并让「勾选完成」这件事带上完成情况记录。
 
 > [!note] 为什么会有这个插件
