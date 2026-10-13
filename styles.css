@@ -533,6 +533,12 @@
 	border-bottom: none;
 }
 
+/* 被状态小标签锁定的那一场会议 */
+.wb-meeting-row.is-locked {
+	background: var(--background-modifier-hover);
+	box-shadow: inset 3px 0 0 var(--interactive-accent);
+}
+
 .wb-link,
 .wb-src {
 	color: var(--link-color);

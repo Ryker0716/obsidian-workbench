@@ -428,6 +428,64 @@ ok('id 为 workbench', manifest.id === 'workbench');
 ok('author 不是中文真名', manifest.author === 'Ryker0716', manifest.author);
 ok('manifest 无个人路径', !/(Users|home)\//.test(JSON.stringify(manifest)));
 
+/* ================= 27. 点会议行的状态小标签：只筛这一场 ================= */
+console.log('\n=== 27. 会议行状态小标签只筛这一场 ===');
+const MT = (p, status, sourceDate, mine) => ({
+	file: { path: p, basename: p.replace(/^.*\//, '') },
+	status, sourceDate, mine: !!mine, description: 'd', assignees: [],
+});
+const msnap = {
+	hasSelf: true,
+	tasks: [
+		MT('会议/a.md', 'doing', '2026-10-13', true),
+		MT('会议/a.md', 'doing', '2026-10-13', false),
+		MT('会议/a.md', 'done', '2026-10-13', true),
+		MT('会议/b.md', 'doing', '2026-10-13', true),
+		MT('会议/b.md', 'doing', '2026-10-12', true),
+	],
+	allMeetings: [{ path: '会议/a.md' }, { path: '会议/b.md' }],
+	counts: { todo: 0, doing: 4, done: 1, cancelled: 0 },
+	mineMonthTaskCount: 5,
+	mineMonthMeetingCount: 2,
+};
+msnap.allTasks = msnap.tasks;
+const mno = new Date('2026-10-13T10:00:00+08:00');
+
+{
+	const v = W.filterByMeeting(msnap, '会议/a.md', false, mno);
+	// 核心：只设 statusFilter=doing 会把 a 的 2 项 + b 的 2 项都拉出来
+	ok('全库进行中 4 项', msnap.tasks.filter((t) => t.status === 'doing').length === 4);
+	ok('锁定 a 后只剩 3 项', v.tasks.length === 3, String(v.tasks.length));
+	ok('其中进行中 2 项（不是全库的 4）', v.tasks.filter((t) => t.status === 'doing').length === 2);
+	ok('全部来自 a 会议', v.tasks.every((t) => t.file.path === '会议/a.md'));
+	ok('原快照未被改动', msnap.tasks.length === 5);
+	ok('counts 按这场会议重算', v.counts.doing === 2 && v.counts.done === 1, JSON.stringify(v.counts));
+	ok('本月任务数=3', v.monthTaskCount === 3, String(v.monthTaskCount));
+	ok('本月会议数=1', v.monthMeetingCount === 1, String(v.monthMeetingCount));
+	ok('allTasks 也收窄（供下游复用）', v.allTasks.every((t) => t.file.path === '会议/a.md'));
+}
+{
+	ok('空路径原样返回', W.filterByMeeting(msnap, null, false, mno) === msnap);
+	ok('空快照原样返回', W.filterByMeeting(null, '会议/a.md', false, mno) === null);
+	ok('未知会议原样返回（不回空看板）', W.filterByMeeting(msnap, '会议/x.md', false, mno) === msnap);
+}
+{
+	const v = W.filterByMeeting(msnap, '会议/a.md', true, mno);
+	ok('叠加只看我的：a 里我的 2 项', v.tasks.length === 2, String(v.tasks.length));
+	const noSelf = Object.assign({}, msnap, { hasSelf: false });
+	ok('没填「我是谁」时不按 mine 过滤',
+		W.filterByMeeting(noSelf, '会议/a.md', true, mno).tasks.length === 3);
+}
+{
+	const other = new Date('2026-11-05T10:00:00+08:00');
+	const v = W.filterByMeeting(msnap, '会议/a.md', false, other);
+	ok('11 月看 10 月会议：本月数归零', v.monthTaskCount === 0 && v.monthMeetingCount === 0);
+	ok('任务本身仍在（只不算本月）', v.tasks.length === 3);
+}
+ok('会议筛选不进扫描缓存键',
+	W.viewCacheKey({ scope: 'month' }) ===
+		W.viewCacheKey({ scope: 'month', meetingFilter: '会议/a.md', statusFilter: 'doing' }));
+
 /* ================= 汇总 ================= */
 console.log(`\n${'='.repeat(48)}`);
 if (fail) {

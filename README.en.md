@@ -42,6 +42,7 @@ Three tabs:
 Capabilities:
 
 - **Monthly meeting stats** — top stat cards show this month's meeting count, action items, in-progress and done; **cards are clickable** — one click filters the board below accordingly.
+- **Drill down from the meeting list** — the `In progress 2` badge on each meeting row is clickable: it shows only **that meeting's 2 tasks in that state**, not every matching task in the vault. The locked row is highlighted, a `Meeting: xxx ×` chip appears in the toolbar, and clicking any of them clears the lock.
 - **Action item board** — Not started / In progress / Done three columns. Rule: a task counts as "Not started" only if `🛫 start date` is in the future; **tasks without a start date always count as "In progress"**.
 - **Check to record** — after checking a task on the board, the plugin **shows a confirmation dialog first** (clicking "Cancel" leaves your note untouched byte-for-byte). On confirm it writes the standard `✅ YYYY-MM-DD` and asks for the outcome, recording your answer as a sub-line under the task.
 - **Checking in the editor is captured too** — changing `- [ ]` to `- [x]` in the editor triggers the same dialog.

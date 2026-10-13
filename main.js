@@ -450,6 +450,43 @@ function countByStatus(tasks) {
 	return c;
 }
 
+/**
+ * 会议行里点了状态小标签后的收窄（纯函数，便于单测）。
+ *
+ * 为什么需要它：会议行右侧的「进行中 7」如果只设 statusFilter，
+ * 看板会把**全库**所有进行中的任务都拉出来，而不是这一场的 7 项。
+ * 所以点小标签时必须同时锁定会议。
+ *
+ * @param {object} snapshot 扫描快照
+ * @param {string|null} meetingPath 锁定的会议文件路径
+ * @param {boolean} onlyMine 是否叠加「只看我的」
+ * @param {Date} now 用于算「本月」口径
+ */
+function filterByMeeting(snapshot, meetingPath, onlyMine, now) {
+	if (!meetingPath || !snapshot) return snapshot;
+	const mine = onlyMine && snapshot.hasSelf ? (t) => t.mine : () => true;
+
+	const pool = snapshot.allTasks || snapshot.tasks || [];
+	const all = pool.filter((t) => t.file && t.file.path === meetingPath && mine(t));
+	// 这场会议在当前范围内没有任务了（例如切了范围），自动解除，避免空看板
+	const known = (snapshot.allMeetings || []).some((m) => m.path === meetingPath);
+	if (!all.length && !known) return snapshot;
+
+	const tasks = (snapshot.tasks || []).filter(
+		(t) => t.file && t.file.path === meetingPath && mine(t),
+	);
+	const ref = now || new Date();
+	const inMonth = all.filter((t) => isInMonth(t.sourceDate, ref));
+	return Object.assign({}, snapshot, {
+		tasks,
+		allTasks: all,
+		counts: countByStatus(tasks),
+		// 两张「本月」卡也收窄到这场会议，避免卡片数字与看板打架
+		monthTaskCount: inMonth.length,
+		monthMeetingCount: inMonth.length ? 1 : 0,
+	});
+}
+
 /* ---------------- 未来工作安排（一件事 = 一个笔记） ---------------- */
 
 const PLAN_DATE_PREFIX_RE = /^(\d{4}-\d{2}-\d{2})-(.+)$/;
@@ -1257,6 +1294,9 @@ class WorkbenchView extends ItemView {
 			scope: plugin.settings.defaultScope || 'meetings',
 			search: '',
 			statusFilter: null,
+			// 会议行里点的那个状态小标签：只留这一场会议。与 statusFilter 叠加使用，
+			// 两者都不进扫描缓存键——只重绘 DOM，不重扫仓库。
+			meetingFilter: null,
 			onlyMine: false,
 			rangeStart: null,
 			rangeEnd: null,
@@ -1316,8 +1356,8 @@ class WorkbenchView extends ItemView {
 			this.renderPlan(contentEl, snapshot);
 			return;
 		}
-		// 回顾页：「只看我的」开关在此生效（scan 已给每条任务打好 mine 标记）
-		const view = this.applyMine(snapshot);
+		// 回顾页：先按会议行收窄（点了某场会议的状态标签时），再让「只看我的」生效
+		const view = this.applyMine(this.applyMeeting(snapshot));
 		this.renderHeader(contentEl, view);
 		this.renderToolbar(contentEl, view);
 		this.renderMeetings(contentEl, view);
@@ -1406,13 +1446,28 @@ class WorkbenchView extends ItemView {
 	applyMine(snapshot) {
 		if (!this.state.onlyMine || !snapshot || !snapshot.hasSelf) return snapshot;
 		const tasks = snapshot.tasks.filter((t) => t.mine);
-		return Object.assign({}, snapshot, {
+		const out = Object.assign({}, snapshot, {
 			tasks,
 			counts: countByStatus(tasks),
 			meetings: (snapshot.meetings || []).filter((m) => (m.tasks || []).some((t) => t.mine)),
-			monthMeetingCount: snapshot.mineMonthMeetingCount,
-			monthTaskCount: snapshot.mineMonthTaskCount,
 		});
+		// 已锁定某场会议时，applyMeeting 已按「我的」算好两张本月卡，别再覆盖；
+		// 否则用快照里预计算的「我的」本月数量。
+		if (!this.state.meetingFilter) {
+			out.monthTaskCount = snapshot.mineMonthTaskCount;
+			out.monthMeetingCount = snapshot.mineMonthMeetingCount;
+		}
+		return out;
+	}
+
+	/**
+	 * 会议行里点了状态小标签：把看板收窄到「这一场会议」。
+	 * 必须先按会议收窄再交给其它筛选，否则点「进行中 7」会把库里的
+	 * 全部进行中任务都拉出来，而不是这一场的 7 项。
+	 * 会议筛选不进扫描缓存键：只重绘 DOM，不重扫仓库。
+	 */
+	applyMeeting(snapshot) {
+		return filterByMeeting(snapshot, this.state.meetingFilter, this.state.onlyMine, new Date());
 	}
 
 	/** 页签：回顾（会议行动项） / 计划（未来工作安排） */
@@ -1831,7 +1886,7 @@ class WorkbenchView extends ItemView {
 				cls: 'wb-accent',
 				tip: `只看本月会议（${monthKey(now)}）：会议清单与看板都限本月`,
 				active: monthScope,
-				patch: { scope: 'month', statusFilter: null },
+				patch: { scope: 'month', statusFilter: null, meetingFilter: null },
 			},
 			{
 				label: '本月行动项',
@@ -1840,7 +1895,7 @@ class WorkbenchView extends ItemView {
 				cls: '',
 				tip: '本月全部行动项：清除状态筛选',
 				active: monthScope && !sf,
-				patch: { scope: 'month', statusFilter: null },
+				patch: { scope: 'month', statusFilter: null, meetingFilter: null },
 			},
 			{
 				label: '未开始',
@@ -1849,7 +1904,7 @@ class WorkbenchView extends ItemView {
 				cls: 'wb-todo',
 				tip: '未开始 = 开始日期 🛫 尚未到；没有开始日期的任务算进行中。再点一次取消筛选',
 				active: sf === STATUS.TODO,
-				patch: { statusFilter: sf === STATUS.TODO ? null : STATUS.TODO },
+				patch: { statusFilter: sf === STATUS.TODO ? null : STATUS.TODO, meetingFilter: null },
 			},
 			{
 				label: '进行中',
@@ -1858,7 +1913,7 @@ class WorkbenchView extends ItemView {
 				cls: 'wb-doing',
 				tip: '进行中 = 已到开始日期、或未填写开始日期的未完成任务。再点一次取消筛选',
 				active: sf === STATUS.DOING,
-				patch: { statusFilter: sf === STATUS.DOING ? null : STATUS.DOING },
+				patch: { statusFilter: sf === STATUS.DOING ? null : STATUS.DOING, meetingFilter: null },
 			},
 			{
 				label: '已完成',
@@ -1867,7 +1922,7 @@ class WorkbenchView extends ItemView {
 				cls: 'wb-done',
 				tip: '只看已完成的任务（再点一次取消）',
 				active: sf === STATUS.DONE,
-				patch: { statusFilter: sf === STATUS.DONE ? null : STATUS.DONE },
+				patch: { statusFilter: sf === STATUS.DONE ? null : STATUS.DONE, meetingFilter: null },
 			},
 		];
 
@@ -1945,7 +2000,7 @@ class WorkbenchView extends ItemView {
 			if (this.state.scope === val) opt.selected = true;
 		});
 		select.addEventListener('change', () => {
-			const patch = { scope: select.value };
+			const patch = { scope: select.value, meetingFilter: null };
 			if (select.value === 'range' && (!this.state.rangeStart || !this.state.rangeEnd)) {
 				const d = new Date();
 				patch.rangeStart = this.state.rangeStart || firstDayOfMonth(d);
@@ -2004,6 +2059,14 @@ class WorkbenchView extends ItemView {
 			chip.createSpan({ text: `状态：${STATUS_LABEL[this.state.statusFilter]}` });
 			const x = chip.createEl('button', { cls: 'wb-chip-x', text: '×', attr: { title: '清除状态筛选' } });
 			x.addEventListener('click', () => this.applyFilter({ statusFilter: null }));
+		}
+
+		if (this.state.meetingFilter) {
+			const locked = (snapshot.allMeetings || []).find((m) => m.path === this.state.meetingFilter);
+			const chip = bar.createDiv({ cls: 'wb-filter-chip' });
+			chip.createSpan({ text: `会议：${locked ? locked.name : '已锁定'}` });
+			const x = chip.createEl('button', { cls: 'wb-chip-x', text: '×', attr: { title: '取消会议锁定' } });
+			x.addEventListener('click', () => this.applyFilter({ meetingFilter: null }));
 		}
 
 		if (this.state.onlyMine && snapshot.hasSelf) {
@@ -2098,14 +2161,20 @@ class WorkbenchView extends ItemView {
 		shown = shown.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
 		// 选了状态筛选时，会议清单只保留该状态下有任务的会议
 		if (sf) shown = shown.filter((m) => m.counts[sf] > 0);
+		// 点了某场会议的状态标签：清单只留这一场，方便对照
+		const mf = this.state.meetingFilter;
+		if (mf) shown = shown.filter((m) => m.path === mf);
 
 		const box = root.createDiv({ cls: 'wb-panel wb-meetings' });
 		const head = box.createDiv({ cls: 'wb-panel-head' });
-		head.createSpan({
-			text: sf
-				? `${baseLabel} · 含「${STATUS_LABEL[sf]}」任务（${shown.length} 次）`
-				: `${baseLabel}（${shown.length} 次）`,
-		});
+		const headText = sf
+			? `${baseLabel} · 含「${STATUS_LABEL[sf]}」任务（${shown.length} 次）`
+			: `${baseLabel}（${shown.length} 次）`;
+		head.createSpan({ text: mf ? '已锁定 1 场会议' : headText });
+		if (mf) {
+			const un = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部会议' });
+			un.addEventListener('click', () => this.applyFilter({ meetingFilter: null }));
+		}
 		const toggle = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '收起' });
 		const list = box.createDiv({ cls: 'wb-meeting-list' });
 		let collapsed = false;
@@ -2121,7 +2190,8 @@ class WorkbenchView extends ItemView {
 		}
 
 		shown.forEach((m) => {
-			const row = list.createDiv({ cls: 'wb-meeting-row' });
+			const locked = mf === m.path;
+			const row = list.createDiv({ cls: `wb-meeting-row${locked ? ' is-locked' : ''}` });
 			const link = row.createEl('a', { cls: 'wb-link', text: `${m.date} ${m.name}` });
 			link.addEventListener('click', (e) => {
 				e.preventDefault();
@@ -2133,14 +2203,24 @@ class WorkbenchView extends ItemView {
 				['doing', 'wb-dot-doing'],
 				['done', 'wb-dot-done'],
 			].forEach(([key, cls]) => {
+				const active = locked && sf === key;
 				const chip = counts.createSpan({
-					cls: `wb-dot ${cls}${sf === key ? ' is-active' : ''}`,
+					cls: `wb-dot ${cls}${active ? ' is-active' : ''}`,
 					text: `${STATUS_LABEL[key]} ${m.counts[key]}`,
+					attr: {
+						title: `只看这场会议里「${STATUS_LABEL[key]}」的 ${m.counts[key]} 项任务（再点一次取消）`,
+					},
 				});
 				chip.addEventListener('click', (e) => {
 					e.preventDefault();
 					e.stopPropagation();
-					this.applyFilter({ statusFilter: this.state.statusFilter === key ? null : key });
+					// 关键：同时锁定「这一场会议」和「这个状态」，
+					// 否则只会把库里该状态的任务都拉出来，而不是这一场的。
+					if (active) {
+						this.applyFilter({ meetingFilter: null, statusFilter: null });
+					} else {
+						this.applyFilter({ meetingFilter: m.path, statusFilter: key });
+					}
 				});
 			});
 		});
@@ -2162,10 +2242,18 @@ class WorkbenchView extends ItemView {
 			const items = sortedBy(snapshot.tasks.filter((t) => t.status === sf));
 			const colEl = board.createDiv({ cls: `wb-column ${COL_CLASS[sf]}` });
 			const head = colEl.createDiv({ cls: 'wb-column-head' });
-			head.createSpan({ cls: 'wb-column-title', text: `${STATUS_LABEL[sf]}的任务` });
+			const lockedM = this.state.meetingFilter
+				? (snapshot.allMeetings || []).find((m) => m.path === this.state.meetingFilter)
+				: null;
+			head.createSpan({
+				cls: 'wb-column-title',
+				text: lockedM ? `${lockedM.name} · ${STATUS_LABEL[sf]}` : `${STATUS_LABEL[sf]}的任务`,
+			});
 			head.createSpan({ cls: 'wb-column-count', text: String(items.length) });
 			const clear = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部' });
-			clear.addEventListener('click', () => this.applyFilter({ statusFilter: null }));
+			clear.addEventListener('click', () =>
+				this.applyFilter({ statusFilter: null, meetingFilter: null }),
+			);
 
 			const body = colEl.createDiv({ cls: 'wb-column-body wb-column-body-wide' });
 			if (!items.length) {
@@ -3479,6 +3567,7 @@ module.exports.parsePersonList = parsePersonList;
 module.exports.nameMatchesSelf = nameMatchesSelf;
 module.exports.taskInvolvesMe = taskInvolvesMe;
 module.exports.countByStatus = countByStatus;
+module.exports.filterByMeeting = filterByMeeting;
 module.exports.STATUS = STATUS;
 module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;
