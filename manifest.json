@@ -1,7 +1,7 @@
 {
   "id": "workbench",
   "name": "工作台",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.6.0",
   "description": "会议工作台：统计本月会议次数，汇总会议行动项（未开始/进行中/已完成），勾选完成时自动写入完成时间并弹窗询问完成情况。",
   "author": "Ryker0716",

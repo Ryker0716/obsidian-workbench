@@ -217,6 +217,20 @@ tests/run.js             assertions: pure functions + synthesized vault scanning
 
 By design, the logic is written as **pure functions that don't depend on Obsidian** (`parseTaskLine`, `deriveStatus`, `applyStatusChange`, `isSourcePathForScope`…), all exported via `module.exports`, so they can be asserted directly in Node. When adding new logic, add a case to `tests/run.js`.
 
+## Changelog
+
+### 1.0.1
+
+- **Fix: clicking a meeting row's status badge now filters to that one meeting.** Previously clicking `In progress 7` pulled in **every** in-progress task in the vault instead of that meeting's 7. Now the badge locks both the meeting and the status:
+  - New pure function `filterByMeeting(snapshot, meetingPath, onlyMine, now)` narrows the task set by meeting path and re-scopes the two "this month" cards so the numbers don't disagree with the board;
+  - The locked row is highlighted, a `Meeting: xxx ×` chip appears in the toolbar, and the list header reads "1 meeting locked"; clear it by clicking the badge again, the chip's `×`, or "Show all meetings";
+  - The single-column board title reads "Meeting name · In progress" so you never lose track of which meeting you're viewing; it stacks with "Only mine".
+- Added `versions.json` (used by the community plugin marketplace).
+
+### 1.0.0
+
+First release. Counts meetings, organizes action items (not started / in progress / done), manages upcoming work plans, and records completion time plus an outcome note when you check a task off.
+
 ## Known limitations
 
 - Overdue tasks are **not specially handled**: unfinished tasks past their `📅` still show as "In progress", with only a one-line backlog reminder on the Overview page.

@@ -427,6 +427,11 @@ const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest
 ok('id 为 workbench', manifest.id === 'workbench');
 ok('author 不是中文真名', manifest.author === 'Ryker0716', manifest.author);
 ok('manifest 无个人路径', !/(Users|home)\//.test(JSON.stringify(manifest)));
+ok('版本号是 x.y.z', /^\d+\.\d+\.\d+$/.test(manifest.version), manifest.version);
+ok('versions.json 覆盖当前版本',
+	JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'versions.json'), 'utf8'))[manifest.version] ===
+		manifest.minAppVersion,
+	`versions.json 缺 ${manifest.version}`);
 
 /* ================= 27. 点会议行的状态小标签：只筛这一场 ================= */
 console.log('\n=== 27. 会议行状态小标签只筛这一场 ===');
