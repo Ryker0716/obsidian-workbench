@@ -441,13 +441,28 @@ function taskInvolvesMe(task, selfNames) {
 	return (task.sourceAttendees || []).some((n) => nameMatchesSelf(n, mine));
 }
 
-/** 按状态汇总任务数（看板三栏与统计卡共用） */
-function countByStatus(tasks) {
-	const c = { todo: 0, doing: 0, done: 0, cancelled: 0 };
+/** 按状态汇总任务数（看板三栏与统计卡共用）。today 可选：给了就顺带数出逾期数 */
+function countByStatus(tasks, today) {
+	const c = { todo: 0, doing: 0, done: 0, cancelled: 0, overdue: 0 };
+	const ref = today || formatDate(new Date());
 	(tasks || []).forEach((t) => {
-		if (t && c[t.status] !== undefined) c[t.status] += 1;
+		if (!t) return;
+		if (c[t.status] !== undefined) c[t.status] += 1;
+		if (isOverdueTask(t, ref)) c.overdue += 1;
 	});
 	return c;
+}
+
+/**
+ * 是否已过截止期：未完成（未开始/进行中，且未取消）且截止日期早于今天。
+ * 已完成的任务哪怕过线也不算逾期——已经交代过了。
+ * @param {object} task 解析出的任务
+ * @param {string} todayStr YYYY-MM-DD
+ */
+function isOverdueTask(task, todayStr) {
+	if (!task || !task.due) return false;
+	if (task.status === STATUS.DONE || task.status === STATUS.CANCELLED) return false;
+	return task.due < todayStr;
 }
 
 /**
@@ -480,10 +495,36 @@ function filterByMeeting(snapshot, meetingPath, onlyMine, now) {
 	return Object.assign({}, snapshot, {
 		tasks,
 		allTasks: all,
-		counts: countByStatus(tasks),
+		counts: countByStatus(tasks, formatDate(ref)),
 		// 两张「本月」卡也收窄到这场会议，避免卡片数字与看板打架
 		monthTaskCount: inMonth.length,
 		monthMeetingCount: inMonth.length ? 1 : 0,
+	});
+}
+
+/**
+ * 「已逾期」透视（纯函数，便于单测）。
+ *
+ * 为什么需要它：逾期任务往往来自**过去的会议**（比如 9 月的会排出 📅 9-20，
+ * 10 月还没做完）。回顾页默认按「会议日期」圈范围，过去会议的任务根本不在
+ * 当前范围的看板里，用户想查「过期的待办」无从下手。所以这个透视和
+ * filterByMeeting 一样从 allTasks（本次扫描的全量池）里取，
+ * 跨范围把所有未完成且 📅 早于今天的任务拉出来。
+ *
+ * @param {object} snapshot 扫描快照
+ * @param {boolean} onlyMine 是否叠加「只看我的」
+ * @param {Date} now 用于算「今天」
+ */
+function filterOverdue(snapshot, onlyMine, now) {
+	if (!snapshot) return snapshot;
+	const today = formatDate(now || new Date());
+	const mine = onlyMine && snapshot.hasSelf ? (t) => t.mine : () => true;
+	const pool = snapshot.allTasks || snapshot.tasks || [];
+	const tasks = pool.filter((t) => isOverdueTask(t, today) && mine(t));
+	return Object.assign({}, snapshot, {
+		tasks,
+		// allTasks 保持全量池不动：后续「锁定某场会议」仍要能从池子里筛
+		counts: countByStatus(tasks, today),
 	});
 }
 
@@ -1298,6 +1339,9 @@ class WorkbenchView extends ItemView {
 			// 两者都不进扫描缓存键——只重绘 DOM，不重扫仓库。
 			meetingFilter: null,
 			onlyMine: false,
+			// 「已逾期」透视：从全量任务池里把未完成且 📅 早于今天的拉出来。
+			// 与 statusFilter 一样不进扫描缓存键——只重绘 DOM，不重扫仓库。
+			overdueFilter: false,
 			rangeStart: null,
 			rangeEnd: null,
 			tab: 'overview',
@@ -1356,8 +1400,8 @@ class WorkbenchView extends ItemView {
 			this.renderPlan(contentEl, snapshot);
 			return;
 		}
-		// 回顾页：先按会议行收窄（点了某场会议的状态标签时），再让「只看我的」生效
-		const view = this.applyMine(this.applyMeeting(snapshot));
+		// 回顾页：逾期透视 → 会议行收窄 → 只看我的，逐层叠加
+		const view = this.applyMine(this.applyMeeting(this.applyOverdue(snapshot)));
 		this.renderHeader(contentEl, view);
 		this.renderToolbar(contentEl, view);
 		this.renderMeetings(contentEl, view);
@@ -1439,6 +1483,14 @@ class WorkbenchView extends ItemView {
 	}
 
 	/**
+	 * 「已逾期」透视（不进扫描缓存键）：把全量池里未完成且过截止期的任务
+	 * 拉进看板，不受当前「范围」限制——逾期的活儿往往挂在过去的会议里。
+	 */
+	applyOverdue(snapshot) {
+		return filterOverdue(snapshot, this.state.onlyMine, new Date());
+	}
+
+	/**
 	 * 按「只看我的」开关收窄快照（只影响回顾页）。
 	 * 不改原对象，返回浅拷贝，避免污染扫描缓存。
 	 * 本月会议 / 本月行动项两张卡也一并收窄，否则数字会和下方看板打架。
@@ -1448,7 +1500,7 @@ class WorkbenchView extends ItemView {
 		const tasks = snapshot.tasks.filter((t) => t.mine);
 		const out = Object.assign({}, snapshot, {
 			tasks,
-			counts: countByStatus(tasks),
+			counts: countByStatus(tasks, formatDate(new Date())),
 			meetings: (snapshot.meetings || []).filter((m) => (m.tasks || []).some((t) => t.mine)),
 		});
 		// 已锁定某场会议时，applyMeeting 已按「我的」算好两张本月卡，别再覆盖；
@@ -1677,9 +1729,7 @@ class WorkbenchView extends ItemView {
 		const arrangements = snapshot.arrangements || [];
 
 		const futureArrs = arrangements.filter((a) => a.date && a.date >= today);
-		const overdueTasks = allTasks.filter(
-			(t) => t.status !== STATUS.DONE && t.status !== STATUS.CANCELLED && t.due && t.due < today,
-		);
+		const overdueTasks = allTasks.filter((t) => isOverdueTask(t, today));
 		const pastArrs = arrangements.filter((a) => a.date && a.date < today);
 
 		// 指标卡：点一下跳到对应页签/筛选
@@ -1708,6 +1758,15 @@ class WorkbenchView extends ItemView {
 				cls: 'wb-doing',
 				tip: '跳到「回顾」只看进行中的任务',
 				go: () => this.goTab('review', { scope: 'month', statusFilter: STATUS.DOING }),
+			},
+			{
+				label: '已逾期',
+				value: overdueTasks.length,
+				unit: '项',
+				cls: 'wb-overdue',
+				tip: '跨范围：未完成且已过截止日期的任务（含过去会议里排的）。点开直接看逾期清单',
+				go: () =>
+					this.goTab('review', { overdueFilter: true, statusFilter: null, meetingFilter: null }),
 			},
 			{
 				label: '已完成',
@@ -1823,8 +1882,14 @@ class WorkbenchView extends ItemView {
 			tip.createSpan({
 				text: `另有 ${overdueTasks.length} 项待办已过截止日期${pastArrs.length ? `、${pastArrs.length} 条安排已过去` : ''}`,
 			});
-			const b = tip.createEl('button', { cls: 'wb-btn wb-btn-mini', text: '查看计划页', attr: { type: 'button' } });
-			b.addEventListener('click', () => this.goTab('plan'));
+			const b = tip.createEl('button', {
+				cls: 'wb-btn wb-btn-mini',
+				text: '查看逾期清单',
+				attr: { type: 'button', title: '到「回顾」页看全部已过截止日期的待办（跨范围）' },
+			});
+			b.addEventListener('click', () =>
+				this.goTab('review', { overdueFilter: true, statusFilter: null, meetingFilter: null }),
+			);
 		}
 	}
 
@@ -1876,6 +1941,7 @@ class WorkbenchView extends ItemView {
 		const now = new Date();
 		const header = root.createDiv({ cls: 'wb-header' });
 		const sf = this.state.statusFilter;
+		const od = this.state.overdueFilter;
 		const monthScope = this.state.scope === 'month';
 
 		const cards = [
@@ -1885,8 +1951,8 @@ class WorkbenchView extends ItemView {
 				unit: '次',
 				cls: 'wb-accent',
 				tip: `只看本月会议（${monthKey(now)}）：会议清单与看板都限本月`,
-				active: monthScope,
-				patch: { scope: 'month', statusFilter: null, meetingFilter: null },
+				active: monthScope && !od,
+				patch: { scope: 'month', statusFilter: null, meetingFilter: null, overdueFilter: null },
 			},
 			{
 				label: '本月行动项',
@@ -1894,8 +1960,8 @@ class WorkbenchView extends ItemView {
 				unit: '项',
 				cls: '',
 				tip: '本月全部行动项：清除状态筛选',
-				active: monthScope && !sf,
-				patch: { scope: 'month', statusFilter: null, meetingFilter: null },
+				active: monthScope && !sf && !od,
+				patch: { scope: 'month', statusFilter: null, meetingFilter: null, overdueFilter: null },
 			},
 			{
 				label: '未开始',
@@ -1924,6 +1990,15 @@ class WorkbenchView extends ItemView {
 				active: sf === STATUS.DONE,
 				patch: { statusFilter: sf === STATUS.DONE ? null : STATUS.DONE, meetingFilter: null },
 			},
+			{
+				label: '已逾期',
+				value: `${snapshot.counts.overdue}`,
+				unit: '项',
+				cls: 'wb-overdue',
+				tip: '跨范围汇总：未完成且 📅 截止日期早于今天的任务（来自过去会议的也算）。可与状态卡叠加。再点一次取消',
+				active: od,
+				patch: { overdueFilter: !od, meetingFilter: null },
+			},
 		];
 
 		cards.forEach((c) => {
@@ -1949,6 +2024,7 @@ class WorkbenchView extends ItemView {
 		const cap = root.createDiv({ cls: 'wb-scope-note' });
 		cap.setText(
 			`统计范围：${scopeLabel}${sf ? ` · 已筛选：${STATUS_LABEL[sf]}` : ''}` +
+				(od ? ' · 已逾期透视（跨范围，含过去会议里的任务）' : '') +
 				(this.state.onlyMine && snapshot.hasSelf
 					? ` · 只看我的（${(this.plugin.settings.selfNames || []).filter(Boolean).join('、')}）`
 					: '') +
@@ -2069,6 +2145,17 @@ class WorkbenchView extends ItemView {
 			x.addEventListener('click', () => this.applyFilter({ meetingFilter: null }));
 		}
 
+		if (this.state.overdueFilter) {
+			const chip = bar.createDiv({ cls: 'wb-filter-chip wb-chip-overdue' });
+			chip.createSpan({ text: '已逾期' });
+			const x = chip.createEl('button', {
+				cls: 'wb-chip-x',
+				text: '×',
+				attr: { title: '清除「已逾期」透视' },
+			});
+			x.addEventListener('click', () => this.applyFilter({ overdueFilter: false }));
+		}
+
 		if (this.state.onlyMine && snapshot.hasSelf) {
 			const who = (this.plugin.settings.selfNames || []).filter(Boolean).join('、');
 			const chip = bar.createDiv({ cls: 'wb-filter-chip' });
@@ -2080,9 +2167,11 @@ class WorkbenchView extends ItemView {
 		const note = bar.createDiv({ cls: 'wb-toolbar-note' });
 		// 全库档会跳过不含 #action 的文件，不能按「会议/文档」拆分统计
 		note.setText(
-			this.state.scope === 'all'
-				? `扫描 ${snapshot.fileCount} 篇文件（其中含 #action 的收进看板）/ ${snapshot.tasks.length} 项行动`
-				: `扫描 ${snapshot.allMeetings.length} 篇会议` +
+			this.state.overdueFilter
+				? `已逾期透视：全量池里 ${snapshot.tasks.length} 项未完成且已过截止日期（不受上方范围限制）`
+				: this.state.scope === 'all'
+					? `扫描 ${snapshot.fileCount} 篇文件（其中含 #action 的收进看板）/ ${snapshot.tasks.length} 项行动`
+					: `扫描 ${snapshot.allMeetings.length} 篇会议` +
 						(snapshot.docCount ? ` + ${snapshot.docCount} 篇文档` : '') +
 						(snapshot.arrangements && snapshot.arrangements.length
 							? ` + ${snapshot.arrangements.length} 条安排`
@@ -2142,10 +2231,24 @@ class WorkbenchView extends ItemView {
 		const now = new Date();
 		const sf = this.state.statusFilter;
 		const scope = this.state.scope;
+		const od = this.state.overdueFilter;
+		const today = formatDate(now);
 
 		let shown;
 		let baseLabel;
-		if (scope === 'range') {
+		// 每场会议在「当前透视」下应显示的计数：普通模式用全量计数，
+		// 逾期透视只数这场里逾期（且叠加状态筛选）的任务
+		let countsOf = (m) => m.counts;
+		if (od) {
+			// 逾期透视：跨范围列出「有逾期任务」的会议（含过去的会议）
+			const isOd = (t) => isOverdueTask(t, today);
+			shown = (snapshot.allMeetings || []).filter((m) => (m.tasks || []).some(isOd));
+			baseLabel = '含逾期任务的会议';
+			countsOf = (m) => {
+				const odTasks = (m.tasks || []).filter(isOd);
+				return countByStatus(odTasks, today);
+			};
+		} else if (scope === 'range') {
 			shown = snapshot.meetings.slice(); // scan 已按区间过滤
 			baseLabel = `${snapshot.rangeStart} ~ ${snapshot.rangeEnd}`;
 		} else if (scope === 'month') {
@@ -2159,8 +2262,10 @@ class WorkbenchView extends ItemView {
 		}
 
 		shown = shown.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
-		// 选了状态筛选时，会议清单只保留该状态下有任务的会议
-		if (sf) shown = shown.filter((m) => m.counts[sf] > 0);
+		if (sf) {
+			// 选了状态筛选时，会议清单只保留该状态下有任务的会议
+			shown = shown.filter((m) => countsOf(m)[sf] > 0);
+		}
 		// 点了某场会议的状态标签：清单只留这一场，方便对照
 		const mf = this.state.meetingFilter;
 		if (mf) shown = shown.filter((m) => m.path === mf);
@@ -2198,6 +2303,7 @@ class WorkbenchView extends ItemView {
 				this.plugin.openFile(m.file);
 			});
 			const counts = row.createDiv({ cls: 'wb-meeting-counts' });
+			const mc = countsOf(m);
 			[
 				['todo', 'wb-dot-todo'],
 				['doing', 'wb-dot-doing'],
@@ -2206,9 +2312,9 @@ class WorkbenchView extends ItemView {
 				const active = locked && sf === key;
 				const chip = counts.createSpan({
 					cls: `wb-dot ${cls}${active ? ' is-active' : ''}`,
-					text: `${STATUS_LABEL[key]} ${m.counts[key]}`,
+					text: `${STATUS_LABEL[key]} ${mc[key]}`,
 					attr: {
-						title: `只看这场会议里「${STATUS_LABEL[key]}」的 ${m.counts[key]} 项任务（再点一次取消）`,
+						title: `只看这场会议里「${STATUS_LABEL[key]}」的 ${mc[key]} 项任务（再点一次取消）`,
 					},
 				});
 				chip.addEventListener('click', (e) => {
@@ -2228,6 +2334,7 @@ class WorkbenchView extends ItemView {
 
 	renderBoard(root, snapshot) {
 		const sf = this.state.statusFilter;
+		const od = this.state.overdueFilter;
 		const sortedBy = (items) =>
 			items.slice().sort((a, b) => {
 				const da = a.due || '9999-99-99';
@@ -2235,6 +2342,34 @@ class WorkbenchView extends ItemView {
 				if (da !== db) return da.localeCompare(db);
 				return String(b.sourceDate || '').localeCompare(String(a.sourceDate || ''));
 			});
+
+		// 逾期透视（未叠状态筛选）：单独一栏「已逾期」占满整宽，按截止日期升序——越早过期的排越前
+		if (od && !sf) {
+			const board = root.createDiv({ cls: 'wb-board wb-board-single' });
+			const items = sortedBy(snapshot.tasks);
+			const colEl = board.createDiv({ cls: 'wb-column wb-col-doing' });
+			const head = colEl.createDiv({ cls: 'wb-column-head' });
+			const lockedM = this.state.meetingFilter
+				? (snapshot.allMeetings || []).find((m) => m.path === this.state.meetingFilter)
+				: null;
+			head.createSpan({
+				cls: 'wb-column-title',
+				text: lockedM ? `${lockedM.name} · 已逾期` : '已逾期的任务',
+			});
+			head.createSpan({ cls: 'wb-column-count', text: String(items.length) });
+			const clear = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部' });
+			clear.addEventListener('click', () =>
+				this.applyFilter({ overdueFilter: false, meetingFilter: null }),
+			);
+
+			const body = colEl.createDiv({ cls: 'wb-column-body wb-column-body-wide' });
+			if (!items.length) {
+				body.createDiv({ cls: 'wb-empty', text: '没有已过截止日期的未完成任务' });
+			} else {
+				items.forEach((task) => this.renderCard(body, task));
+			}
+			return;
+		}
 
 		if (sf) {
 			// 选中某个状态：只显示该栏，占满整宽
@@ -2247,12 +2382,18 @@ class WorkbenchView extends ItemView {
 				: null;
 			head.createSpan({
 				cls: 'wb-column-title',
-				text: lockedM ? `${lockedM.name} · ${STATUS_LABEL[sf]}` : `${STATUS_LABEL[sf]}的任务`,
+				text: lockedM
+					? `${lockedM.name} · ${STATUS_LABEL[sf]}`
+					: `${STATUS_LABEL[sf]}${od ? ' · 已逾期' : ''}的任务`,
 			});
 			head.createSpan({ cls: 'wb-column-count', text: String(items.length) });
 			const clear = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部' });
 			clear.addEventListener('click', () =>
-				this.applyFilter({ statusFilter: null, meetingFilter: null }),
+				this.applyFilter(
+					od
+						? { overdueFilter: false, statusFilter: null, meetingFilter: null }
+						: { statusFilter: null, meetingFilter: null },
+				),
 			);
 
 			const body = colEl.createDiv({ cls: 'wb-column-body wb-column-body-wide' });
@@ -2942,7 +3083,7 @@ class WorkbenchPlugin extends Plugin {
 			allMeetings: meetings,
 			tasks: visibleTasks,
 			allTasks: tasks,
-			counts: countByStatus(visibleTasks),
+			counts: countByStatus(visibleTasks, formatDate(now)),
 			hasSelf: selfNames.length > 0,
 			mineTaskCount,
 			mineMeetingCount,
@@ -3567,7 +3708,9 @@ module.exports.parsePersonList = parsePersonList;
 module.exports.nameMatchesSelf = nameMatchesSelf;
 module.exports.taskInvolvesMe = taskInvolvesMe;
 module.exports.countByStatus = countByStatus;
+module.exports.isOverdueTask = isOverdueTask;
 module.exports.filterByMeeting = filterByMeeting;
+module.exports.filterOverdue = filterOverdue;
 module.exports.STATUS = STATUS;
 module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;

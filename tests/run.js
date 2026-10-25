@@ -215,8 +215,8 @@ ok('姓名包含匹配', W.nameMatchesSelf('张三', ['张三']) === true);
 ok('重名带公司后缀也算我', W.nameMatchesSelf('张三-示例公司', ['张三']) === true);
 ok('空姓名不命中', W.nameMatchesSelf('', ['张三']) === false);
 
-/* ================= 14. countByStatus ================= */
-console.log('\n=== 14. countByStatus ===');
+/* ================= 14. countByStatus + 逾期透视 ================= */
+console.log('\n=== 14. countByStatus / isOverdueTask / filterOverdue ===');
 const c = W.countByStatus([
 	{ status: 'done' }, { status: 'done' }, { status: 'doing' }, { status: 'todo' }, { status: 'cancelled' },
 ]);
@@ -224,6 +224,55 @@ ok('已完成 2', c.done === 2, JSON.stringify(c));
 ok('进行中 1', c.doing === 1);
 ok('未开始 1', c.todo === 1);
 ok('已取消 1', c.cancelled === 1);
+
+// isOverdueTask：判定口径
+const OD_TODAY = '2026-10-25';
+ok('逾期：doing + 📅 昨天', W.isOverdueTask({ status: 'doing', due: '2026-10-24' }, OD_TODAY) === true);
+ok('不逾期：📅 今天', W.isOverdueTask({ status: 'doing', due: OD_TODAY }, OD_TODAY) === false);
+ok('不逾期：📅 明天', W.isOverdueTask({ status: 'doing', due: '2026-10-26' }, OD_TODAY) === false);
+ok('已完成不算逾期', W.isOverdueTask({ status: 'done', due: '2026-10-24' }, OD_TODAY) === false);
+ok('已取消不算逾期', W.isOverdueTask({ status: 'cancelled', due: '2026-10-24' }, OD_TODAY) === false);
+ok('无 📅 不算逾期', W.isOverdueTask({ status: 'doing' }, OD_TODAY) === false);
+ok('空任务不崩', W.isOverdueTask(null, OD_TODAY) === false);
+ok('todo + 过期也算逾期', W.isOverdueTask({ status: 'todo', due: '2026-10-20' }, OD_TODAY) === true);
+
+// countByStatus 带今天 → 顺带数逾期
+const c2 = W.countByStatus(
+	[
+		{ status: 'doing', due: '2026-10-20' },
+		{ status: 'todo', due: '2026-10-24' },
+		{ status: 'done', due: '2026-10-24' },
+		{ status: 'doing', due: '2026-10-30' },
+	],
+	OD_TODAY,
+);
+ok('counts.overdue = 2', c2.overdue === 2, JSON.stringify(c2));
+
+// filterOverdue：跨范围透视
+const odPool = [
+	{ status: 'doing', due: '2026-10-20', file: { path: 'a.md' } },
+	{ status: 'todo', due: '2026-10-24', file: { path: 'a.md' } },
+	{ status: 'doing', due: '2026-10-30', file: { path: 'b.md' } },
+	{ status: 'done', due: '2026-10-24', file: { path: 'b.md' } },
+];
+const odSnap = { tasks: odPool, allTasks: odPool, counts: W.countByStatus(odPool, OD_TODAY), hasSelf: false };
+const odView = W.filterOverdue(odSnap, false, new Date('2026-10-25T10:00:00'));
+ok('逾期透视：只剩 2 项', odView.tasks.length === 2);
+ok('逾期透视：counts.overdue 同步', odView.counts.overdue === 2);
+ok('逾期透视：allTasks 保持全量池', odView.allTasks.length === 4);
+ok('空快照原样返回', W.filterOverdue(null, false, new Date()) === null);
+// 逾期 + 只看我的 叠加（mine 标记在扫描期就打在任务对象上，allTasks 与 tasks 同源）
+const odPoolMine = odPool.map((t, i) => Object.assign({}, t, { mine: i === 0 }));
+const odMine = W.filterOverdue(
+	{ tasks: odPoolMine, allTasks: odPoolMine, counts: {}, hasSelf: true },
+	true,
+	new Date('2026-10-25T10:00:00'),
+);
+ok('逾期 + 只看我的：1 项', odMine.tasks.length === 1, JSON.stringify(odMine.tasks.map(t=>t.due)));
+// 逾期透视不进扫描缓存键
+ok('逾期透视不进扫描缓存键',
+	W.viewCacheKey({ scope: 'month' }) ===
+		W.viewCacheKey({ scope: 'month', overdueFilter: true, statusFilter: 'doing' }));
 
 /* ================= 15. 时间标记 ================= */
 console.log('\n=== 15. 时间标记 ===');
