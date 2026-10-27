@@ -10,7 +10,7 @@
  *      并弹窗询问「完成情况」，内容写成任务下方的缩进子行；
  *   4) 在普通笔记视图里直接勾选任务（Tasks 插件或原生复选框），同样会触发询问。
  *
- * 任务格式（兼容 Tasks 插件的 emoji 格式）：
+ * 任务格式（沿用仓库既有约定，兼容 Tasks 插件）：
  *   - [ ] #action 任务内容 👤执行人 📅 2026-10-10 ➕ 2026-10-01
  *   - [/] #action 进行中的任务 🛫 2026-10-08
  *   - [x] #action 已完成的任务 ✅ 2026-10-12
@@ -63,47 +63,30 @@ const DONE_DATE_RE = /✅\s*(\d{4}-\d{2}-\d{2})/;
 const CREATED_RE = /➕\s*(\d{4}-\d{2}-\d{2})/;
 const ASSIGNEE_RE = /👤\s*([^\s👤📅➕✅🛫🔺⏫🔼🔽⏳]+)/g;
 const PRIORITY_RE = /🔺|⏫|🔼|🔽/;
-const COMPLETION_NOTE_RE = /完成情况\s*[：:]/;
-
-/**
- * 工作安排目录的兜底默认。留空会让「回顾」页扫不到任何文件，
- * 所以这里给一个中性名字；首次启动的引导页会引导用户改成自己的目录。
- */
-const DEFAULT_PLAN_FOLDER = '计划';
-
-/**
- * 取目录列表里第一个有效项。注意 `[]` 是 truthy，
- * 所以不能写 `list || [兜底]`——空列表时会拿到 undefined。
- */
-function firstFolder(list, fallback) {
-	const hit = (list || []).find((f) => f && String(f).trim());
-	return hit ? String(hit).trim() : fallback || '';
-}
+// 完成情况子行的历史标签：写入用 settings.completionLabel（可配置），
+// 但撤销清理必须同时认识老笔记里写死的「完成情况」，见 completionNoteRe()
+const LEGACY_COMPLETION_LABEL = '完成情况';
 
 const DEFAULT_SETTINGS = {
-	// 会议目录：这些目录里的 .md 一律算会议。首次安装为空，请到设置里填成你自己的目录。
-	meetingFolders: [],
+	meetingFolders: ['02-Business/1.会议', '01-Company/3.运营/润道智算科技/会议纪要'],
 	// 附加目录：里面的 #action 也进看板；其中只有带 `会议类别` 的才算会议、计入会议数
-	extraFolders: [],
+	extraFolders: ['02-Business/2.商机', '02-Business/3.项目'],
 	// 未来工作安排目录：`YYYY-MM-DD-事件.md`，一个安排一个笔记
-	planFolders: [DEFAULT_PLAN_FOLDER],
-	// Calendar 点出来的文件：日期 < 今天 落会议目录，日期 >= 今天 落工作安排目录。
-	// 开始日期落位目录留空时该分支自动跳过，不会误建到别处。
+	planFolders: ['04-Operations'],
+	// Calendar 点出来的文件：日期 < 今天 落会议目录，日期 >= 今天 落工作安排目录
 	calendarDailyRouting: true,
-	calendarMeetingFolder: '',
-	calendarMeetingTemplate: '',
+	calendarMeetingFolder: '02-Business/1.会议',
+	calendarMeetingTemplate: '99-System/Templates/纪要模版.md',
 	taskTag: '#action',
-	// 「只看我的」判定用：填自己的姓名/别名（多个用顿号或换行分隔），留空则按钮禁用
-	selfNames: [],
+	// 「只看我的」判定用：设置里可改成自己的姓名/别名（多个用顿号或换行分隔）
+	selfNames: ['赖凯'],
 	defaultScope: 'month',
 	writeStartDate: true,
 	promptInView: true,
 	promptInEditor: true,
 	completionLabel: '完成情况',
 	promptPresets: ['已按时完成', '部分完成', '延期完成', '受阻待跟进'],
-	excludeFolders: [],
-	// 首次安装引导是否已处理（用户点了「跳过」或配好了目录就置 true）
-	onboardingDismissed: false,
+	excludeFolders: ['99-System/Templates', '07-Archive'],
 };
 
 /* ------------------------------------------------------------------ */
@@ -152,14 +135,25 @@ function tomorrowOf(d) {
 	return formatDate(new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1));
 }
 
-function cleanDescription(body, taskTag) {
+/**
+ * 只摘掉任务标记（👤/📅/🛫/✅/➕/⏰/优先级），保留加粗、双链等正文写法。
+ * 表单里粘来的描述可能自带这些标记，重排时会与表单值重复甚至顶掉用户刚填的日期。
+ */
+function stripTaskMarkers(body, taskTag) {
 	let t = String(body == null ? '' : body);
 	if (taskTag) t = t.split(taskTag).join(' ');
 	t = t.replace(/👤\s*[^\s👤📅➕✅🛫🔺⏫🔼🔽⏳⏰]+/g, ' ');
-	t = t.replace(/[📅🛫✅➕]\s*\d{4}-\d{2}-\d{2}/g, ' ');
-	t = t.replace(/[📅🛫✅➕]\s*/g, ' ');
+	// 正向字符类里的非 BMP 表情（📅🛫✅➕🔺🔼🔽）必须带 u 标志：
+	// 否则字符类按代理对拆成两半，匹配时会切走 emoji 的一半，留下孤立代理对（显示成 �）。
+	t = t.replace(/[📅🛫✅➕]\s*\d{4}-\d{2}-\d{2}/gu, ' ');
+	t = t.replace(/[📅🛫✅➕]\s*/gu, ' ');
 	t = t.replace(/⏰\s*\d{1,2}:\d{2}/g, ' ');
-	t = t.replace(/[🔺⏫🔼🔽⏳]/g, ' ');
+	t = t.replace(/[🔺⏫🔼🔽⏳]/gu, ' ');
+	return t.replace(/\s+/g, ' ').trim();
+}
+
+function cleanDescription(body, taskTag) {
+	let t = stripTaskMarkers(body, taskTag);
 	t = t.replace(/\*\*([^*]+)\*\*/g, '$1');
 	t = t.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
 	t = t.replace(/\[\[([^\]]+)\]\]/g, '$1');
@@ -205,7 +199,6 @@ function parseTaskLine(line, lineNumber, taskTag, today) {
 		created: (CREATED_RE.exec(body) || [])[1] || null,
 		priority: (PRIORITY_RE.exec(body) || [])[0] || null,
 		rawLine: line,
-		hasCompletionNote: false,
 	};
 }
 
@@ -276,10 +269,29 @@ function findChildBlockEnd(lines, taskIndex) {
 	return i;
 }
 
-function hasCompletionNoteBelow(lines, taskIndex) {
+/** 正则转义（用于把用户配置的完成标签拼进正则） */
+function escapeRegExp(s) {
+	return String(s == null ? '' : s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 完成情况子行的标记正则。
+ * 标签可配置（settings.completionLabel），但历史子行写的是「完成情况」，
+ * 两者都要认——否则改了标签就删不掉旧子行，撤销/重做时残留两条。
+ */
+function completionNoteRe(label) {
+	const custom = String(label || '').trim() || LEGACY_COMPLETION_LABEL;
+	const alts = custom === LEGACY_COMPLETION_LABEL
+		? escapeRegExp(LEGACY_COMPLETION_LABEL)
+		: `${escapeRegExp(custom)}|${escapeRegExp(LEGACY_COMPLETION_LABEL)}`;
+	return new RegExp(`(?:${alts})\\s*[：:]`);
+}
+
+function hasCompletionNoteBelow(lines, taskIndex, label) {
 	const end = findChildBlockEnd(lines, taskIndex);
+	const re = completionNoteRe(label);
 	for (let i = taskIndex + 1; i < end; i++) {
-		if (COMPLETION_NOTE_RE.test(lines[i])) return true;
+		if (re.test(lines[i])) return true;
 	}
 	return false;
 }
@@ -302,13 +314,14 @@ function insertAfterTaskBlock(lines, taskIndex, newLine) {
 }
 
 /** 撤销完成时，清掉本插件自动写入的完成情况子行，避免残留旧结论、并让再次完成能重新询问 */
-function removeCompletionNotes(lines, taskIndex) {
+function removeCompletionNotes(lines, taskIndex, label) {
 	const end = findChildBlockEnd(lines, taskIndex);
+	const re = completionNoteRe(label);
 	const out = [];
 	for (let i = 0; i < lines.length; i++) {
 		if (i > taskIndex && i < end) {
 			const l = lines[i];
-			if (COMPLETION_NOTE_RE.test(l) && /^[\s>]*[-*+]\s*✅/.test(l)) continue;
+			if (re.test(l) && /^[\s>]*[-*+]\s*✅/.test(l)) continue;
 		}
 		out.push(lines[i]);
 	}
@@ -469,8 +482,8 @@ function isOverdueTask(task, todayStr) {
  * 会议行里点了状态小标签后的收窄（纯函数，便于单测）。
  *
  * 为什么需要它：会议行右侧的「进行中 7」如果只设 statusFilter，
- * 看板会把**全库**所有进行中的任务都拉出来，而不是这一场的 7 项。
- * 所以点小标签时必须同时锁定会议。
+ * 看板会把**全库**所有进行中的任务都拉出来（可能几百项），
+ * 而不是这一场会议的 7 项。所以点小标签时必须同时锁定会议。
  *
  * @param {object} snapshot 扫描快照
  * @param {string|null} meetingPath 锁定的会议文件路径
@@ -554,7 +567,7 @@ function parseDailyFileName(fileName) {
 
 /**
  * Calendar 文件名的基础部分（不含 `.md`）。
- * 新生成的一律是 `YYYY-MM-DD-工作安排`，与工作安排目录里计划文件的命名、二级分类一致。
+ * 新生成的一律是 `YYYY-MM-DD-工作安排`，与仓库里计划文件的命名、二级分类一致。
  */
 function dailyFileBase(dateStr) {
 	return `${dateStr}-工作安排`;
@@ -569,6 +582,11 @@ function dailyFileBase(dateStr) {
 function isPastDate(dateStr, todayStr) {
 	if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || ''))) return false;
 	return String(dateStr) < String(todayStr);
+}
+
+/** YAML 双引号值：转义反斜杠与双引号，避免地点/参与人里的 `"` 写坏 frontmatter */
+function yamlQuote(value) {
+	return `"${String(value == null ? '' : value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 /**
@@ -607,10 +625,10 @@ function dailyNoteTargetPath(opts, exists) {
 }
 
 /**
- * 把用户配置的会议纪要模版渲染成一条可用的会议笔记。
+ * 把 `99-System/Templates/纪要模版.md` 渲染成一条可用的会议笔记。
  * 模版里的 Templater 语法（`<% tp.date.now(...) %>`）脱离 Templater 上下文时要自己替换，
  * 否则生成的笔记里会残留语法字符串。同时在 `# 1.  基本信息` 前补一行 `# 日期 标题`
- * ——插件生成的纪要统一带这行 H1，模版本身通常没有。
+ * ——仓库里的会议纪要都有这行 H1，模版本身没有。
  */
 function renderMeetingTemplate(template, input) {
 	const date = String(input.date || '');
@@ -622,26 +640,16 @@ function renderMeetingTemplate(template, input) {
 	let text = String(template || '')
 		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DDTHH:mm:ss\+08:00"\)\s*%>/g, stamp)
 		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DD"\)\s*%>/g, date);
-	// 模版的 modified / date 可能是写死的常量（不是 Templater 语法），必须替换成本次生成的值，
-	// 否则生成的会议笔记会带着模版作者当时的日期。
+	// 模版的 modified 是写死的常量（不是 Templater 语法），必须替换成本次生成时间
 	text = text.replace(/^modified:.*$/m, `modified: ${stamp}`);
-	if (date) text = text.replace(/^date:.*$/m, `date: ${date}`);
-	// 模版里的「会议主题/时间/地点」三行是空的，按已知信息补上
-	text = text.replace(/^(- \*\*会议主题\*\*)[ \t]*：.*$/m, `$1：${title}`);
-	if (time) text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, `$1 ${date} ${time}`);
-	else text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, `$1 ${date}`);
-	if (place) text = text.replace(/^(- \*\*会议地点\*\*：).*$/m, `$1${place}`);
-	// 模版里「像待办」的行（含 👤 或 📅）若没写任务标签，照抄出来不会进工作台看板；补上以保持联动。
-	// 只补这类行，避免把模版里普通的示例复选框也变成统计对象。
-	const taskTag = String(input.taskTag || '#action');
-	text = text
-		.split('\n')
-		.map((l) => {
-			if (l.includes(taskTag)) return l;
-			if (!/[👤📅]/.test(l)) return l;
-			return l.replace(/^([ \t>]*-[ \t]+\[[ \t]\][ \t]+)/, `$1${taskTag} `);
-		})
-		.join('\n');
+	// 模版里的「会议主题/时间/地点」三行是空的，按已知信息补上。
+	// replacement 一律写成函数：用户输入里的 `$&`/`$$`/`$1` 否则会被当成替换模式展开。
+	text = text.replace(/^(- \*\*会议主题\*\*)[ \t]*：.*$/m, (m0, head) => `${head}：${title}`);
+	if (time) text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, (m0, head) => `${head} ${date} ${time}`);
+	else text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, (m0, head) => `${head} ${date}`);
+	if (place) text = text.replace(/^(- \*\*会议地点\*\*：).*$/m, (m0, head) => `${head}${place}`);
+	// 模版的待办占位没有 #action，照抄出来不会进工作台看板；补上标签以保持联动
+	text = text.replace(/^- \[ \] 任务内容 👤执行人 📅 (\d{4}-\d{2}-\d{2})[ \t]*$/m, `- [ ] #action 任务内容 👤执行人 📅 $1`);
 	const lines = text.split('\n');
 	// 模版 frontmatter 收尾后多了一行孤立的 `---`（模版自身的历史笔误），
 	// 真实会议纪要里没有；渲染时去掉，避免出来一个空分隔块。
@@ -660,7 +668,7 @@ function renderMeetingTemplate(template, input) {
 	return lines.join('\n');
 }
 
-/** 兜底：没配置模版、或模版读不到时，用这份内置结构生成会议笔记 */
+/** 兜底：仓库里找不到纪要模版时，用这份内置结构生成会议笔记 */
 function buildMeetingDayNote(input) {
 	const now = input.now || new Date();
 	const date = input.date;
@@ -774,8 +782,17 @@ function applyTaskEdits(line, edits, taskTag) {
 	const tagRaw = body.includes(taskTag) ? taskTag : null;
 	if (tagRaw) body = body.replace(tagRaw, ' ');
 
-	// 描述：去掉末尾残留的问候性空格
-	let desc = edits.description == null ? body.replace(/\s+/g, ' ').trim() : String(edits.description).trim();
+	// 描述：去掉末尾残留的问候性空格；表单值里内嵌的任务标记也要摘掉
+	let desc;
+	if (edits.description == null) {
+		desc = body.replace(/\s+/g, ' ').trim();
+	} else {
+		const raw = String(edits.description).trim();
+		const cleaned = stripTaskMarkers(raw, taskTag);
+		// 整个描述都是标记（例如只粘了「📅 2026-12-01」）时按原文保留，
+		// 否则摘空后会把用户写的描述整段丢掉
+		desc = cleaned.trim() ? cleaned : raw;
+	}
 
 	const due = edits.due === undefined ? tags.due : edits.due ? `📅 ${edits.due}` : null;
 	const assignees =
@@ -798,6 +815,19 @@ function applyTaskEdits(line, edits, taskTag) {
 	if (priority) parts.push(priority);
 	out += parts.join(' ');
 	return out;
+}
+
+/**
+ * 会议清单排序：按日期降序，**无日期的一律排最后**。
+ * 无日期时 `String(undefined)` 会变成字面 'undefined'/'null' 参与比较，位置随机。
+ */
+function compareMeetingsByDateDesc(a, b) {
+	const ad = a && a.date ? String(a.date) : '';
+	const bd = b && b.date ? String(b.date) : '';
+	if (!ad && !bd) return 0;
+	if (!ad) return 1;
+	if (!bd) return -1;
+	return bd.localeCompare(ad);
 }
 
 /** 相对今天的时间分组键 */
@@ -866,8 +896,11 @@ function nextPlanPath(item, input, exists) {
 	const named = parsePlanFileName(item.fileName);
 	if (!named) return oldPath;
 	const nextDate = (input && input.date) || named.date;
-	const nextTitle = sanitizeFileName(String((input && input.title) || '').trim() || named.title);
-	if (nextDate === named.date && nextTitle === named.title) return oldPath;
+	// 「没改过名」用**原始输入名**判定：文件名本身含 `|#^[]`（如「银联|交流」）时，
+	// sanitize 会改写它，但用户并没有改名，不能因此把文件改掉。
+	const rawTitle = String((input && input.title) || '').trim() || named.title;
+	const nextTitle = sanitizeFileName(rawTitle);
+	if (nextDate === named.date && rawTitle === named.title) return oldPath;
 	const folder = oldPath.slice(0, oldPath.lastIndexOf('/') + 1);
 	const base = `${nextDate}-${nextTitle}`;
 	let candidate = `${folder}${base}.md`;
@@ -917,9 +950,9 @@ function buildArrangementNote(input, now) {
 	lines.push(`date: ${date}`);
 	lines.push('一级分类: 运营');
 	lines.push('二级分类: 工作安排');
-	lines.push(`时间: "${time || ''}"`);
-	lines.push(`地点: "${(input.place || '').trim()}"`);
-	lines.push(`参与人: "${(input.attendees || '').trim()}"`);
+	lines.push(`时间: ${yamlQuote(time || '')}`);
+	lines.push(`地点: ${yamlQuote((input.place || '').trim())}`);
+	lines.push(`参与人: ${yamlQuote((input.attendees || '').trim())}`);
 	lines.push('状态: 待处理');
 	lines.push('tags: [工作安排]');
 	lines.push('---');
@@ -975,26 +1008,26 @@ function rewriteArrangementNote(content, input, now) {
 	const attendees = String(input.attendees || '').trim();
 
 	let out = content;
-	// frontmatter
-	out = out.replace(/^date:\s*\d{4}-\d{2}-\d{2}/m, `date: ${date}`);
-	out = out.replace(/^modified:\s*.*$/m, `modified: ${formatDateTime(when).replace(' ', 'T')}:00+08:00`);
-	out = out.replace(/^时间:\s*.*$/m, `时间: "${time}"`);
-	out = out.replace(/^地点:\s*.*$/m, `地点: "${place}"`);
-	out = out.replace(/^参与人:\s*.*$/m, `参与人: "${attendees}"`);
+	// frontmatter（replacement 一律用函数，避免用户输入的 `$&`/`$1` 被当替换模式展开）
+	out = out.replace(/^date:\s*\d{4}-\d{2}-\d{2}/m, () => `date: ${date}`);
+	out = out.replace(/^modified:\s*.*$/m, () => `modified: ${formatDateTime(when).replace(' ', 'T')}:00+08:00`);
+	out = out.replace(/^时间:\s*.*$/m, () => `时间: ${yamlQuote(time)}`);
+	out = out.replace(/^地点:\s*.*$/m, () => `地点: ${yamlQuote(place)}`);
+	out = out.replace(/^参与人:\s*.*$/m, () => `参与人: ${yamlQuote(attendees)}`);
 	// 如果原本没有这些行（老笔记），补进 frontmatter 末尾
 	const addIfMissing = (key, line) => {
 		if (new RegExp(`^${key}:`, 'm').test(out)) return;
-		out = out.replace(/^(tags:.*)$/m, `${line}\n$1`);
+		out = out.replace(/^(tags:.*)$/m, (m0, tagsLine) => `${line}\n${tagsLine}`);
 	};
-	addIfMissing('时间', `时间: "${time}"`);
-	addIfMissing('地点', `地点: "${place}"`);
-	addIfMissing('参与人', `参与人: "${attendees}"`);
+	addIfMissing('时间', `时间: ${yamlQuote(time)}`);
+	addIfMissing('地点', `地点: ${yamlQuote(place)}`);
+	addIfMissing('参与人', `参与人: ${yamlQuote(attendees)}`);
 	// 正文标题
-	out = out.replace(/^#\s+.*$/m, `# ${title}`);
+	out = out.replace(/^#\s+.*$/m, () => `# ${title}`);
 	// 安排信息 callout
-	out = out.replace(/^> \*\*时间\*\*：.*$/m, `> **时间**：${date}${time ? ` ${time}` : '（未定）'}`);
-	out = out.replace(/^> \*\*地点\*\*：.*$/m, `> **地点**：${place}`);
-	out = out.replace(/^> \*\*参与人\*\*：.*$/m, `> **参与人**：${attendees}`);
+	out = out.replace(/^> \*\*时间\*\*：.*$/m, () => `> **时间**：${date}${time ? ` ${time}` : '（未定）'}`);
+	out = out.replace(/^> \*\*地点\*\*：.*$/m, () => `> **地点**：${place}`);
+	out = out.replace(/^> \*\*参与人\*\*：.*$/m, () => `> **参与人**：${attendees}`);
 	return out;
 }
 
@@ -1018,10 +1051,15 @@ function firstDayOfMonth(d) {
 	return formatDate(new Date(d.getFullYear(), d.getMonth(), 1));
 }
 
-/** 扫描缓存的键：范围/搜索/时间区间变化都需要重新扫描（状态筛选不进键，重绘即可） */
-function viewCacheKey(state) {
+/**
+ * 扫描缓存的键：范围/搜索/时间区间变化都需要重新扫描（状态筛选不进键，重绘即可）。
+ * 键里带当天日期：跨零点后「本月/区间/逾期」口径都变了，键不变会继续吃旧快照。
+ * `today` 可显式传入（纯函数便于测试），缺省取本机当天。
+ */
+function viewCacheKey(state, today) {
 	if (!state) return '';
-	return `${state.scope || ''}|${state.search || ''}|${state.rangeStart || ''}|${state.rangeEnd || ''}`;
+	const day = today || formatDate(new Date());
+	return `${state.scope || ''}|${state.search || ''}|${state.rangeStart || ''}|${state.rangeEnd || ''}|${day}`;
 }
 
 function folderOf(path) {
@@ -1035,26 +1073,8 @@ function isUnder(path, folder) {
 }
 
 /**
- * 实际生效的排除清单 = 用户显式配置的 `excludeFolders` + 由其它设置推导出的项。
- *
- * 推导是**只读、不落盘**的：这样用户改了「会议纪要模版」的位置后，旧位置的排除
- * 会立刻失效，不会残留成僵尸配置（如果把推导结果写回设置，就会出现「改过的地方
- * 永远被排除」的怪现象）。
- *
- * 这里只排除模版**文件本身**，不排除它所在的目录——模版可能就放在会议目录里，
- * 排除整个目录会把真会议一起干掉。
- */
-function resolveExcludeFolders(settings) {
-	const s = settings || {};
-	const out = (s.excludeFolders || []).filter(Boolean).slice();
-	const tpl = String(s.calendarMeetingTemplate || '').trim().replace(/^\/+/, '');
-	if (tpl && !out.includes(tpl)) out.push(tpl);
-	return out;
-}
-
-/**
  * 扫描来源的排除规则（三类目录共用，必须一致——曾因 planFolders 漏用此规则
- * 导致计划目录下的 AGENTS.md 被当成文档计数）：
+ * 导致 04-Operations/AGENTS.md 被当成文档计数）：
  * 排除目录、assets 附件目录、AGENTS/README/说明/索引 之类非正文文件。
  */
 function isExcludedSourcePath(path, excludeFolders) {
@@ -1074,7 +1094,7 @@ function isExcludedSourcePath(path, excludeFolders) {
  */
 function isSourcePathForScope(path, scope, settings) {
 	const s = settings || {};
-	if (isExcludedSourcePath(path, resolveExcludeFolders(s))) return false;
+	if (isExcludedSourcePath(path, s.excludeFolders)) return false;
 	if (scope === 'all') return true;
 	const inFolders = (list) => (list || []).some((f) => f && isUnder(path, f));
 	return (
@@ -1082,8 +1102,11 @@ function isSourcePathForScope(path, scope, settings) {
 	);
 }
 
-/** 比较修改前后的行，找出「刚被勾选完成」的任务 */
-function findNewlyDoneChanges(oldLines, newLines, taskTag) {
+/**
+ * 比较修改前后的行，找出「刚被勾选完成」的任务。
+ * `completionLabel` 可选：用户改过完成标签后，判断「任务下已有完成子行」要用同一标签口径。
+ */
+function findNewlyDoneChanges(oldLines, newLines, taskTag, completionLabel) {
 	const out = [];
 	if (!Array.isArray(oldLines) || oldLines.length === 0) return out;
 	const oldByIndex = new Map();
@@ -1097,12 +1120,16 @@ function findNewlyDoneChanges(oldLines, newLines, taskTag) {
 	newLines.forEach((l, i) => {
 		const t = parseTaskLine(l, i, taskTag);
 		if (!t || t.status !== STATUS.DONE) return;
-		const prev = oldByIndex.get(i);
+		// 同号旧行只有「描述一致」才算同一条任务：同一次保存里上方插入/删除行时，
+		// oldByIndex.get(i) 拿到的是另一条任务，直接当 prev 会把状态错关联到别人身上
+		// （表现为上方插一行，已完成的任务被误报「刚完成」，取消还原还会改错行）。
+		const sameLine = oldByIndex.get(i);
+		const prev = sameLine && sameLine.description === t.description ? sameLine : null;
 		let wasDone = null;
 		if (prev) wasDone = prev.status;
 		else if (oldByDesc.has(t.description)) wasDone = oldByDesc.get(t.description);
 		if (wasDone === null || wasDone === STATUS.DONE) return;
-		if (hasCompletionNoteBelow(newLines, i)) return;
+		if (hasCompletionNoteBelow(newLines, i, completionLabel)) return;
 		// 带上原始行与原始状态：用户在确认框点「取消」时要精确还原，不能留下半完成状态。
 		// 行号错位（同一次保存里上方行数变化）时拿不到原始行，用 prevStatus 重建。
 		t.prevLine = prev ? prev.rawLine : null;
@@ -1226,7 +1253,7 @@ class ArrangementModal extends Modal {
 			cls: 'wb-modal-hint',
 			text: editing
 				? '改日期/时间/地点/参与人，正文里的待办原样保留'
-				: `会写成 ${this.opts.folder || DEFAULT_PLAN_FOLDER}/YYYY-MM-DD-事件.md`,
+				: `会写成 ${this.opts.folder || '04-Operations'}/YYYY-MM-DD-事件.md`,
 		});
 
 		const form = contentEl.createDiv({ cls: 'wb-form' });
@@ -1253,7 +1280,7 @@ class ArrangementModal extends Modal {
 		l2.createEl('label', { cls: 'wb-form-label', text: '参与人' });
 		this.peopleInput = l2.createEl('input', { type: 'text', cls: 'wb-form-input' });
 		this.peopleInput.value = init.attendees || '';
-		this.peopleInput.placeholder = '例：张三、李四';
+		this.peopleInput.placeholder = '例：赖凯、周华强';
 
 		if (!editing) {
 			const noteRow = form.createDiv({ cls: 'wb-form-row' });
@@ -1348,6 +1375,9 @@ class WorkbenchView extends ItemView {
 			showCancelled: false,
 			planCollapsed: false,
 			upcomingCollapsed: false,
+			// 折叠态存进 state，重渲染（搜索防抖、刷新）后不再被重置
+			meetingsCollapsed: false,
+			pastCollapsed: true,
 		};
 	}
 
@@ -1365,7 +1395,12 @@ class WorkbenchView extends ItemView {
 
 	async onOpen() {
 		this.containerEl.addClass('wb-container');
-		await this.plugin.ensureData(true);
+		if (!(await this.plugin.safeEnsureData(true, this.state))) {
+			// 与 render 的 catch 面板同款：失败时不能停在「正在扫描仓库……」
+			this.contentEl.empty();
+			this.contentEl.createDiv({ cls: 'wb-empty', text: '扫描失败，请查看控制台' });
+			return;
+		}
 		this.render();
 	}
 
@@ -1375,29 +1410,43 @@ class WorkbenchView extends ItemView {
 
 	render() {
 		const { contentEl } = this;
+		// 搜索是防抖触发的整树重建，重建会丢掉输入框的焦点与光标：
+		// 重建前记下位置，重建后自己接回去，否则连打第二个字就会掉焦。
+		const active = typeof document !== 'undefined' ? document.activeElement : null;
+		const searchFocus =
+			active && active.classList && active.classList.contains('wb-search')
+				? { start: active.selectionStart, end: active.selectionEnd }
+				: null;
 		contentEl.empty();
 		contentEl.addClass('wb-root');
-
-		// 首次安装引导：还没配任何目录时先让用户选一种配置方式，避免开局一片空白
-		if (this.plugin.needsOnboarding()) {
-			this.renderOnboarding(contentEl);
-			return;
-		}
 
 		const snapshot = this.plugin.getSnapshot(this.state);
 		if (!snapshot) {
 			contentEl.createDiv({ cls: 'wb-loading', text: '正在扫描仓库……' });
-			this.plugin.ensureData(false).then(() => this.render());
+			this.plugin
+				.ensureData(false, this.state)
+				.then(() => this.render())
+				.catch((e) => {
+					// 扫描失败时不能静默白屏：把错误摆到面板上
+					contentEl.empty();
+					contentEl.createDiv({
+						cls: 'wb-empty',
+						text: `扫描失败：${e && e.message ? e.message : e}`,
+					});
+					console.error('[workbench] 扫描失败', e);
+				});
 			return;
 		}
 
 		this.renderTabs(contentEl, snapshot);
 		if (this.state.tab === 'overview') {
 			this.renderOverview(contentEl, snapshot);
+			this.restoreSearchFocus(searchFocus);
 			return;
 		}
 		if (this.state.tab === 'plan') {
 			this.renderPlan(contentEl, snapshot);
+			this.restoreSearchFocus(searchFocus);
 			return;
 		}
 		// 回顾页：逾期透视 → 会议行收窄 → 只看我的，逐层叠加
@@ -1406,79 +1455,19 @@ class WorkbenchView extends ItemView {
 		this.renderToolbar(contentEl, view);
 		this.renderMeetings(contentEl, view);
 		this.renderBoard(contentEl, view);
+		this.restoreSearchFocus(searchFocus);
 	}
 
-	/**
-	 * 首次安装引导。三种预设，点任意一个都会把 onboardingDismissed 置 true。
-	 * 推荐结构会在库根创建 会议/ 项目/ 计划/ 三个目录——这是用户显式点击的结果，
-	 * 不会在别处偷偷建目录。
-	 */
-	renderOnboarding(root) {
-		const wrap = root.createDiv({ cls: 'wb-onboard' });
-		wrap.createEl('h2', { text: '欢迎使用工作台' });
-		wrap.createEl('p', {
-			cls: 'wb-onboard-lead',
-			text: '工作台需要知道「会议记录放在哪」，才能统计本月会议次数、汇总行动项。先选一种方式开始：',
-		});
-
-		const presets = [
-			{
-				title: '创建推荐目录结构',
-				desc: '在库根新建 会议/、项目/、计划/ 三个目录并自动配好。适合从零开始，或先试一下。',
-				action: '创建并开始',
-			},
-			{
-				title: '使用我已有的目录',
-				desc: '我库里的会议纪要已有固定位置。跳过引导，直接到设置里填路径。',
-				action: '去设置',
-			},
-			{
-				title: '稍后再说',
-				desc: '暂时不配置。随时可以在 设置 → 工作台 里补上。',
-				action: '跳过',
-			},
-		];
-
-		presets.forEach((preset, i) => {
-			const card = wrap.createDiv({ cls: 'wb-onboard-card' });
-			const left = card.createDiv({ cls: 'wb-onboard-card-main' });
-			left.createDiv({ cls: 'wb-onboard-card-title', text: preset.title });
-			left.createDiv({ cls: 'wb-onboard-card-desc', text: preset.desc });
-			const btn = card.createEl('button', { cls: 'wb-btn', text: preset.action, attr: { type: 'button' } });
-			if (i === 0) btn.addClass('wb-btn-done');
-			btn.addEventListener('click', () => this.applyOnboardingPreset(i));
-		});
-
-		wrap.createDiv({
-			cls: 'wb-onboard-foot',
-			text: '任务格式：- [ ] #action 内容 👤执行人 📅 截止日期 ➕ 创建日期。工作台兼容 Tasks 插件的 emoji 格式。',
-		});
-	}
-
-	/** 应用引导预设。0=推荐结构 1=已有目录 2=跳过 */
-	async applyOnboardingPreset(index) {
-		const s = this.plugin.settings;
+	/** 把焦点与光标还给搜索框（重建后 activeElement 已丢失时） */
+	restoreSearchFocus(saved) {
+		if (!saved || typeof document === 'undefined') return;
+		const input = this.contentEl && this.contentEl.querySelector('.wb-search');
+		if (!input || document.activeElement === input) return;
+		input.focus();
 		try {
-			if (index === 0) {
-				for (const folder of ['会议', '项目', '计划']) {
-					if (!this.app.vault.getAbstractFileByPath(folder)) {
-						await this.app.vault.createFolder(folder).catch(() => {});
-					}
-				}
-				s.meetingFolders = ['会议'];
-				s.extraFolders = ['项目'];
-				s.planFolders = ['计划'];
-				s.calendarMeetingFolder = '会议';
-			}
-			s.onboardingDismissed = true;
-			await this.plugin.saveSettings();
-			if (index === 1) {
-				this.plugin.activateSettings();
-				new Notice('请在工作台设置里填写会议目录');
-			}
-			this.render();
+			if (typeof saved.start === 'number') input.setSelectionRange(saved.start, saved.end);
 		} catch (e) {
-			new Notice(`引导设置失败：${e.message}`);
+			// 输入框类型不支持选区时忽略
 		}
 	}
 
@@ -1514,12 +1503,17 @@ class WorkbenchView extends ItemView {
 
 	/**
 	 * 会议行里点了状态小标签：把看板收窄到「这一场会议」。
-	 * 必须先按会议收窄再交给其它筛选，否则点「进行中 7」会把库里的
-	 * 全部进行中任务都拉出来，而不是这一场的 7 项。
+	 * 必须先按会议收窄再交给其它筛选，否则点「进行中 7」会把全库 575 项
+	 * 里所有进行中的任务都拉出来，而不是这一场的 7 项。
 	 * 会议筛选不进扫描缓存键：只重绘 DOM，不重扫仓库。
 	 */
 	applyMeeting(snapshot) {
-		return filterByMeeting(snapshot, this.state.meetingFilter, this.state.onlyMine, new Date());
+		return filterByMeeting(
+			snapshot,
+			this.state.meetingFilter,
+			this.state.onlyMine,
+			new Date(),
+		);
 	}
 
 	/** 页签：回顾（会议行动项） / 计划（未来工作安排） */
@@ -1554,7 +1548,7 @@ class WorkbenchView extends ItemView {
 	}
 
 	openArrangementForm(item) {
-		const folder = firstFolder(this.plugin.settings.planFolders, DEFAULT_PLAN_FOLDER);
+		const folder = (this.plugin.settings.planFolders || ['04-Operations'])[0];
 		if (item && item.file) {
 			new ArrangementModal(this.app, {
 				folder,
@@ -1615,7 +1609,7 @@ class WorkbenchView extends ItemView {
 		if (!future.length && !undated.length) {
 			body.createDiv({
 				cls: 'wb-empty',
-				text: `还没有未来安排。点右上角「＋ 新增安排」录入，会写成 ${firstFolder(this.plugin.settings.planFolders, DEFAULT_PLAN_FOLDER)}/YYYY-MM-DD-事件.md`,
+				text: '还没有未来安排。点右上角「＋ 新增安排」录入，会写成 04-Operations/YYYY-MM-DD-事件.md',
 			});
 		} else {
 			this.renderPlanRows(body, future, now, false);
@@ -1627,26 +1621,34 @@ class WorkbenchView extends ItemView {
 			}
 		}
 
-		// 已过去但仍未处理的安排，折叠展示
+		// 已过去但仍未处理的安排，折叠展示（折叠态存进 state，重渲染后保持）
 		if (past.length) {
 			const box = panel.createDiv({ cls: 'wb-plan-past' });
+			const collapsed = this.state.pastCollapsed !== false;
 			if (this.state.planCollapsed) box.style.display = 'none';
 			const t = box.createEl('button', {
 				cls: 'wb-btn wb-btn-plain',
-				text: `已过去（${past.length}）`,
+				text: this.pastToggleText(past.length),
 				attr: { type: 'button' },
 			});
 			const wrap = box.createDiv({ cls: 'wb-plan-body' });
-			wrap.style.display = 'none';
+			wrap.style.display = collapsed ? 'none' : '';
 			this.renderPlanRows(wrap, past.slice().reverse(), now, true);
 			t.addEventListener('click', () => {
 				const open = wrap.style.display !== 'none';
 				wrap.style.display = open ? 'none' : '';
-				t.setText(`${open ? '展开' : '收起'} 已过去（${past.length}）`);
+				this.state.pastCollapsed = open;
+				t.setText(this.pastToggleText(past.length));
 			});
 		}
 
 		this.renderUpcomingTasks(root, snapshot, now);
+	}
+
+	/** 「已过去」折叠按钮文案：初始渲染与点击后共用，避免初始态漏掉「展开/收起」前缀 */
+	pastToggleText(count) {
+		const collapsed = this.state.pastCollapsed !== false;
+		return `${collapsed ? '展开' : '收起'} 已过去（${count}）`;
 	}
 
 	/** 按日期分组建行：每个日期一条醒目的日期色条，下面挂当天安排 */
@@ -2035,15 +2037,17 @@ class WorkbenchView extends ItemView {
 	/** 点统计卡即改筛选：只改视图状态，必要时才重新扫描 */
 	async applyFilter(patch) {
 		Object.assign(this.state, patch);
-		await this.plugin.ensureData(false);
+		await this.plugin.safeEnsureData(false, this.state);
 		this.render();
 	}
 
 	/** 切页签（可同时改筛选），总览里的卡片用它跳转 */
 	async goTab(tab, patch) {
 		this.state.tab = tab;
+		// 回顾页专用的「单场锁定 / 逾期透视」跨页签不继承，否则从总览跳过去会带着旧筛选
+		Object.assign(this.state, { meetingFilter: null, overdueFilter: null });
 		if (patch) Object.assign(this.state, patch);
-		await this.plugin.ensureData(false);
+		await this.plugin.safeEnsureData(false, this.state);
 		this.render();
 	}
 
@@ -2106,7 +2110,7 @@ class WorkbenchView extends ItemView {
 
 		const refresh = bar.createEl('button', { text: '刷新', cls: 'wb-btn' });
 		refresh.addEventListener('click', async () => {
-			await this.plugin.ensureData(true);
+			if (!(await this.plugin.safeEnsureData(true, this.state))) return;
 			this.plugin.refreshViews();
 			new Notice('工作台已刷新');
 		});
@@ -2166,18 +2170,24 @@ class WorkbenchView extends ItemView {
 
 		const note = bar.createDiv({ cls: 'wb-toolbar-note' });
 		// 全库档会跳过不含 #action 的文件，不能按「会议/文档」拆分统计
-		note.setText(
-			this.state.overdueFilter
-				? `已逾期透视：全量池里 ${snapshot.tasks.length} 项未完成且已过截止日期（不受上方范围限制）`
-				: this.state.scope === 'all'
-					? `扫描 ${snapshot.fileCount} 篇文件（其中含 #action 的收进看板）/ ${snapshot.tasks.length} 项行动`
-					: `扫描 ${snapshot.allMeetings.length} 篇会议` +
-						(snapshot.docCount ? ` + ${snapshot.docCount} 篇文档` : '') +
-						(snapshot.arrangements && snapshot.arrangements.length
-							? ` + ${snapshot.arrangements.length} 条安排`
-							: '') +
-						` / ${snapshot.tasks.length} 项行动`,
-		);
+		let noteText = this.state.overdueFilter
+			? `已逾期透视：全量池里 ${snapshot.tasks.length} 项未完成且已过截止日期（不受上方范围限制）`
+			: this.state.scope === 'all'
+				? `扫描 ${snapshot.fileCount} 篇文件（其中含 #action 的收进看板）/ ${snapshot.tasks.length} 项行动`
+				: `扫描 ${snapshot.allMeetings.length} 篇会议` +
+					(snapshot.docCount ? ` + ${snapshot.docCount} 篇文档` : '') +
+					(snapshot.arrangements && snapshot.arrangements.length
+						? ` + ${snapshot.arrangements.length} 条安排`
+						: '') +
+					` / ${snapshot.tasks.length} 项行动`;
+		const failedCount = (snapshot.readFailed || []).length;
+		if (failedCount) noteText += `，${failedCount} 篇读取失败`;
+		// 本月/区间档按日期圈定来源，无日期的文件会被排除——如实说明，别让人以为漏扫
+		const undatedCount = snapshot.noDateCount || 0;
+		if (undatedCount && (this.state.scope === 'month' || this.state.scope === 'range')) {
+			noteText += `，${undatedCount} 篇无日期未计入`;
+		}
+		note.setText(noteText);
 	}
 
 	/** 自选时间范围：起止日期 + 常用区间快选 */
@@ -2254,14 +2264,16 @@ class WorkbenchView extends ItemView {
 		} else if (scope === 'month') {
 			shown = snapshot.meetings.filter((m) => isInMonth(m.date, now));
 			baseLabel = '本月会议';
-		} else if (scope === 'meetings') {
-			shown = snapshot.allMeetings.filter((m) => isInMonth(m.date, now));
-			baseLabel = '本月会议';
+		} else if (scope === 'meetings' || scope === 'all') {
+			// 「全部（meetings）」与「全库」档：清单就是全部会议。原来这里也按本月过滤、
+			// 标题写死「本月会议」，与范围名矛盾（范围叫全部，清单却只有本月）。
+			shown = (snapshot.allMeetings || []).slice();
+			baseLabel = '全部会议';
 		} else {
-			return; // 全库范围不展示会议清单
+			return; // 其他范围不展示会议清单
 		}
 
-		shown = shown.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)));
+		shown = shown.slice().sort(compareMeetingsByDateDesc);
 		if (sf) {
 			// 选了状态筛选时，会议清单只保留该状态下有任务的会议
 			shown = shown.filter((m) => countsOf(m)[sf] > 0);
@@ -2275,18 +2287,22 @@ class WorkbenchView extends ItemView {
 		const headText = sf
 			? `${baseLabel} · 含「${STATUS_LABEL[sf]}」任务（${shown.length} 次）`
 			: `${baseLabel}（${shown.length} 次）`;
-		head.createSpan({ text: mf ? '已锁定 1 场会议' : headText });
+		head.createSpan({ text: mf ? `已锁定 1 场会议` : headText });
 		if (mf) {
 			const un = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部会议' });
 			un.addEventListener('click', () => this.applyFilter({ meetingFilter: null }));
 		}
-		const toggle = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '收起' });
+		const toggle = head.createEl('button', {
+			cls: 'wb-btn wb-btn-plain',
+			text: this.state.meetingsCollapsed ? '展开' : '收起',
+		});
 		const list = box.createDiv({ cls: 'wb-meeting-list' });
-		let collapsed = false;
+		// 折叠态放 state：原来用局部变量，重渲染（搜索/刷新）后总是弹回展开
+		if (this.state.meetingsCollapsed) list.style.display = 'none';
 		toggle.addEventListener('click', () => {
-			collapsed = !collapsed;
-			list.style.display = collapsed ? 'none' : '';
-			toggle.setText(collapsed ? '展开' : '收起');
+			this.state.meetingsCollapsed = !this.state.meetingsCollapsed;
+			list.style.display = this.state.meetingsCollapsed ? 'none' : '';
+			toggle.setText(this.state.meetingsCollapsed ? '展开' : '收起');
 		});
 
 		if (!shown.length) {
@@ -2297,7 +2313,7 @@ class WorkbenchView extends ItemView {
 		shown.forEach((m) => {
 			const locked = mf === m.path;
 			const row = list.createDiv({ cls: `wb-meeting-row${locked ? ' is-locked' : ''}` });
-			const link = row.createEl('a', { cls: 'wb-link', text: `${m.date} ${m.name}` });
+			const link = row.createEl('a', { cls: 'wb-link', text: `${m.date || '未注明日期'} ${m.name}` });
 			link.addEventListener('click', (e) => {
 				e.preventDefault();
 				this.plugin.openFile(m.file);
@@ -2321,7 +2337,7 @@ class WorkbenchView extends ItemView {
 					e.preventDefault();
 					e.stopPropagation();
 					// 关键：同时锁定「这一场会议」和「这个状态」，
-					// 否则只会把库里该状态的任务都拉出来，而不是这一场的。
+					// 否则只会把全月该状态的任务都拉出来，而不是这一场的。
 					if (active) {
 						this.applyFilter({ meetingFilter: null, statusFilter: null });
 					} else {
@@ -2568,7 +2584,7 @@ class TaskEditModal extends Modal {
 		c2.createEl('label', { cls: 'wb-form-label', text: '执行人' });
 		this.whoInput = c2.createEl('input', { type: 'text', cls: 'wb-form-input' });
 		this.whoInput.value = (t.assignees || []).join('、');
-		this.whoInput.placeholder = '例：张三 或 [[张三]]';
+		this.whoInput.placeholder = '例：赖凯 或 [[赖凯]]';
 
 		const pRow = form.createDiv({ cls: 'wb-form-row' });
 		pRow.createEl('label', { cls: 'wb-form-label', text: '优先级' });
@@ -2643,11 +2659,15 @@ class WorkbenchPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.snapshots = new Map();
-		this.internalWrite = false;
+		// 自写标记用**计数器**而非布尔：并发写入（批量勾选、顺延+刷新）时
+		// 布尔量会被先结束的那次提前置回 false，modify 事件便不再被忽略。
+		this.internalWrites = 0;
 		this.cache = null;
 		this.cacheKey = null;
 		// Calendar 落位：记录本插件正在处理中的创建路径，避免重复处理
 		this.dailyRoutingBusy = new Set();
+		// modify 事件按文件收集批处理：350ms 单槽防抖会把不同文件改成只剩最后一个
+		this.pendingModifyFiles = new Set();
 
 		this.registerView(VIEW_TYPE_WORKBENCH, (leaf) => new WorkbenchView(leaf, this));
 
@@ -2663,7 +2683,7 @@ class WorkbenchPlugin extends Plugin {
 			id: 'refresh-workbench',
 			name: '刷新工作台数据',
 			callback: async () => {
-				await this.ensureData(true);
+				if (!(await this.safeEnsureData(true))) return;
 				this.refreshViews();
 				new Notice('工作台数据已刷新');
 			},
@@ -2680,34 +2700,60 @@ class WorkbenchPlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on('editor-change', (editor, info) => {
 				const file = info && info.file;
-				if (file) this.snapshots.set(file.path, editor.getValue().split('\n'));
+				// 只留跟踪范围内的快照：否则未跟踪文件的快照会常驻，白占内存也永远不会被清理
+				if (file && this.isTracked(file)) this.snapshots.set(file.path, editor.getValue().split('\n'));
 			}),
 		);
 
-		const onModify = debounce((file) => this.handleModify(file), 350, true);
+		// 350ms 内可能改到**不同文件**（批量脚本/同步工具）：单槽防抖只会剩下最后一个，
+		// 所以先把文件收进集合，再由尾沿统一逐个处理。
+		const flushModify = debounce(async () => {
+			const files = [...this.pendingModifyFiles];
+			this.pendingModifyFiles.clear();
+			if (!files.length) return;
+			for (const f of files) {
+				// 单个文件出错不能中断整批（handleModify 自身也有兜底）
+				try {
+					await this.handleModify(f);
+				} catch (e) {
+					console.warn('[workbench] 处理修改失败', f && f.path, e);
+				}
+			}
+			// 整批处理完只重绘一次：逐文件 refreshViews 会做 N 次全量重扫
+			this.refreshViews();
+		}, 350, true);
 		this.registerEvent(
 			this.app.vault.on('modify', (file) => {
-				if (file instanceof TFile && this.isTracked(file)) onModify(file);
+				if (file instanceof TFile && this.isTracked(file)) {
+					this.pendingModifyFiles.add(file);
+					flushModify();
+				}
 			}),
 		);
 
 		// 外部新增/删除/改名同样要重算并重绘：只 invalidateCache 不刷新的话，
-		// 手动往工作安排目录丢一个文件进去，看板要等下次交互才更新。
+		// 手动往 04-Operations 丢一个文件进去，看板要等下次交互才更新。
 		const onStructureChange = debounce(() => this.refreshViews(), 250, true);
-		this.registerEvent(
-			this.app.vault.on('create', (file) => {
-				if (!(file instanceof TFile)) return;
-				if (!file.path.endsWith('.md')) return;
-				// Calendar 落位优先于快照/刷新：改名后旧路径的 snapshot 没有意义
-				const routed = this.handleDailyNoteCreated(file);
-				routed
-					.catch(() => {})
-					.finally(() => {
-						this.snapshotFile(file);
-						onStructureChange();
-					});
-			}),
-		);
+		// create 订阅必须推迟到布局就绪：Obsidian 启动时会给存量文件**补发** create 事件，
+		// 直接订阅会让 Calendar 落位逻辑对历史文件发难（过去日期的笔记会被改写/搬走）。
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.vault.on('create', (file) => {
+					if (!(file instanceof TFile)) return;
+					if (!file.path.endsWith('.md')) return;
+					// Calendar 落位优先于快照/刷新：改名后旧路径的 snapshot 没有意义
+					const routed = this.handleDailyNoteCreated(file);
+					routed
+						.catch(() => {})
+						.finally(() => {
+							// 只给跟踪范围内的文件建快照（isTracked 覆盖 planFolders，
+							// 所以 Calendar 落在 04-Operations 的文件照旧会被快照）
+							if (this.isTracked(file)) this.snapshotFile(file);
+							onStructureChange();
+						});
+				}),
+			);
+		});
 		this.registerEvent(
 			this.app.vault.on('delete', (file) => {
 				if (file instanceof TFile) this.snapshots.delete(file.path);
@@ -2746,32 +2792,26 @@ class WorkbenchPlugin extends Plugin {
 		if (!Array.isArray(this.settings.selfNames)) {
 			this.settings.selfNames = DEFAULT_SETTINGS.selfNames.slice();
 		}
+		if (!Array.isArray(this.settings.excludeFolders)) {
+			this.settings.excludeFolders = DEFAULT_SETTINGS.excludeFolders.slice();
+		}
+		if (!Array.isArray(this.settings.promptPresets)) {
+			this.settings.promptPresets = DEFAULT_SETTINGS.promptPresets.slice();
+		}
 	}
 
 	async saveSettings() {
-		await this.saveData(this.settings);
+		// 存盘失败（磁盘只读/权限/空间）要当场告诉用户，且不能顺手刷新视图假装成功
+		try {
+			await this.saveData(this.settings);
+		} catch (e) {
+			new Notice(`设置保存失败：${e && e.message ? e.message : e}`);
+			console.error('[workbench] 设置保存失败', e);
+			return false;
+		}
 		this.invalidateCache();
 		this.refreshViews();
-	}
-
-	/**
-	 * 是否需要显示首次安装引导。
-	 * 判据只看「会议目录」是否为空——`planFolders` 有兜底默认值（`计划`），
-	 * 不能拿它当判据，否则引导永远不出现。用户点过「跳过」就不再打扰。
-	 */
-	needsOnboarding() {
-		const s = this.settings || {};
-		if (s.onboardingDismissed) return false;
-		return !(s.meetingFolders || []).some((f) => f && String(f).trim());
-	}
-
-	/** 打开工作台设置页（引导里「去设置」用） */
-	activateSettings() {
-		const setting = this.app.setting;
-		if (setting && typeof setting.open === 'function') {
-			setting.open();
-			if (typeof setting.openTabById === 'function') setting.openTabById(this.manifest.id);
-		}
+		return true;
 	}
 
 	/* ------------------- Calendar 自动落位 ------------------- */
@@ -2787,8 +2827,8 @@ class WorkbenchPlugin extends Plugin {
 		if (!(file instanceof TFile) || file.extension !== 'md') return;
 		const date = parseDailyFileName(file.name);
 		if (!date) return;
-		const planFolders = this.settings.planFolders || [];
-		const planRoot = firstFolder(planFolders, DEFAULT_PLAN_FOLDER).replace(/\/+$/, '');
+		const planFolders = this.settings.planFolders || ['04-Operations'];
+		const planRoot = String(planFolders[0] || '').replace(/\/+$/, '');
 		if (!planRoot || !isUnder(file.path, planRoot)) return;
 		// 注意：renameFile 会**原地改写** TFile.path，所以 busy 键必须在改名**之前**
 		// 就取出来存好，且在 finally 里用这个原始键删除——曾因此在 finally 里
@@ -2797,7 +2837,12 @@ class WorkbenchPlugin extends Plugin {
 		const busyKey = file.path;
 		if (this.dailyRoutingBusy.has(busyKey)) return;
 		this.dailyRoutingBusy.add(busyKey);
+		// 阶段标记：正文写成功、改名失败要分开报（否则用户以为整条都没落盘）
+		let phase = 'write';
 		try {
+			// 计数器必须在 try 首行加：后面任何早退（如 !target）都会走 finally 的 -= 1，
+			// 加在后面就会出现「减了没加」，计数器越跑越负，之后所有 modify 事件都被忽略。
+			this.internalWrites += 1;
 			const today = formatDate(new Date());
 			const target = dailyNoteTargetPath(
 				{
@@ -2809,27 +2854,41 @@ class WorkbenchPlugin extends Plugin {
 				},
 				(p) => Boolean(this.app.vault.getAbstractFileByPath(p)),
 			);
-			if (!target) return;
-			this.internalWrite = true;
+			// dailyNoteTargetPath 只在「日期非法 / 没配计划目录 / 过去日期但没配会议目录」时返回 null；
+			// 前两种这里已排除，落到这里就是没配置会议目录——静默 no-op 会让用户以为点击无效。
+			if (!target) {
+				new Notice('未配置过去日期落位目录，文件保留在原处');
+				return;
+			}
 			let body;
 			if (target.kind === 'plan') {
 				// 今天及以后：Calendar 建的是空文件，直接填成一条普通工作安排
 				const existing = await this.app.vault.read(file);
 				if (!existing.trim()) {
 					await this.app.vault.modify(file, buildDailyNote({ date }));
+					// 「已生成」只在真写入时报：文件已有正文（如后台同步补发）时不弹假成功
+					new Notice(`已生成工作安排：${target.path}`);
 				}
 				if (file.path !== target.path) {
+					phase = 'rename';
 					await this.app.fileManager.renameFile(file, target.path);
 				}
 				body = file;
-				new Notice(`已生成工作安排：${target.path}`);
 			} else {
-				// 过去的日期：改成会议纪要，并移到会议目录
+				// 过去的日期：改成会议纪要，并移到会议目录。
+				// 已有正文的绝不覆写/搬移：create 事件对存量文件补发时，无条件覆写会把
+				// 已经写好的会议纪要冲掉（数据丢失）。空文件才是 Calendar 刚建出来的样子。
+				const existing = await this.app.vault.read(file);
+				if (existing.trim()) {
+					console.warn('[workbench] 跳过已存在的过去日期文件', file.path);
+					return;
+				}
 				const tpl = await this.readMeetingTemplate();
 				const content = tpl
 					? renderMeetingTemplate(tpl, { date })
 					: buildMeetingDayNote({ date });
 				await this.app.vault.modify(file, content);
+				phase = 'rename';
 				await this.app.fileManager.renameFile(file, target.path);
 				body = this.app.vault.getAbstractFileByPath(target.path);
 				new Notice(`已按会议记录归档：${target.path}`);
@@ -2839,10 +2898,14 @@ class WorkbenchPlugin extends Plugin {
 			this.refreshViews();
 		} catch (e) {
 			console.error('[workbench] Calendar 落位失败', e);
-			new Notice('Calendar 落位失败，请查看控制台');
+			if (phase === 'rename') {
+				new Notice(`已写入会议纪要正文，但未能移入会议目录：${e.message}`);
+			} else {
+				new Notice('Calendar 落位失败，请查看控制台');
+			}
 		} finally {
 			this.dailyRoutingBusy.delete(busyKey);
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 	}
 
@@ -2855,6 +2918,8 @@ class WorkbenchPlugin extends Plugin {
 		try {
 			return await this.app.vault.cachedRead(f);
 		} catch (e) {
+			// 降级用内置结构没问题，但要留痕：否则模版路径写错时用户完全无感
+			console.warn('[workbench] 会议纪要模版读取失败，已用内置结构', path, e);
 			return null;
 		}
 	}
@@ -2863,7 +2928,7 @@ class WorkbenchPlugin extends Plugin {
 
 	/** 排除规则：排除目录、assets 附件目录、AGENTS/README 之类索引文件 */
 	isExcludedPath(path) {
-		return isExcludedSourcePath(path, resolveExcludeFolders(this.settings));
+		return isExcludedSourcePath(path, this.settings.excludeFolders);
 	}
 
 	/** 是否在「会议目录」下（这些目录里的文件默认都算会议） */
@@ -2917,17 +2982,40 @@ class WorkbenchPlugin extends Plugin {
 		return this.cache;
 	}
 
-	async ensureData(force) {
-		const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_WORKBENCH)[0];
-		const state =
-			leaf && leaf.view && leaf.view.state
-				? leaf.view.state
-				: { scope: this.settings.defaultScope, search: '' };
+	/**
+	 * 取（必要时重算）快照。state 由调用方传入：双 leaf 时不能想当然拿 leaf[0] 的 state，
+	 * 否则非首个 leaf 的视图会用自己的键去查别的 state 算出来的缓存，永远拿不到、永远重扫（渲染死循环）。
+	 * 不传 state 时（如命令面板刷新）回退到 leaf[0]，保持兼容。
+	 */
+	async ensureData(force, state) {
+		if (!state) {
+			const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_WORKBENCH)[0];
+			state =
+				leaf && leaf.view && leaf.view.state
+					? leaf.view.state
+					: { scope: this.settings.defaultScope, search: '' };
+		}
 		const key = viewCacheKey(state);
 		if (!force && this.cache && this.cacheKey === key) return this.cache;
 		this.cache = await this.scan(state);
 		this.cacheKey = key;
 		return this.cache;
+	}
+
+	/**
+	 * ensureData 的兜底包装：扫描抛错时提示并返回 false。
+	 * 裸 await ensureData 的异常在 Obsidian 里只会变成控制台一条未捕获拒绝，
+	 * 界面则永远停在「正在扫描仓库……」。
+	 */
+	async safeEnsureData(force, state) {
+		try {
+			await this.ensureData(force, state);
+			return true;
+		} catch (e) {
+			console.error('[workbench] 扫描失败', e);
+			new Notice(`扫描失败：${e && e.message ? e.message : e}`);
+			return false;
+		}
 	}
 
 	refreshViews() {
@@ -2958,23 +3046,40 @@ class WorkbenchPlugin extends Plugin {
 		const meetings = [];
 		const tasks = [];
 		const arrangements = [];
+		// 读盘失败的文件：跳过（continue 合理）但必须留痕，否则表现为「文件凭空消失」
+		const readFailed = [];
+		// 取不到日期的来源文件数：month/range 档会被排除，需在工具栏如实提示
+		let noDateCount = 0;
 		let docCount = 0;
 
 		const chunk = 40;
 		for (let i = 0; i < files.length; i += chunk) {
 			const slice = files.slice(i, i + chunk);
 			const contents = await Promise.all(
-				slice.map((f) => this.app.vault.cachedRead(f).catch(() => '')),
+				slice.map((f) =>
+					this.app.vault.cachedRead(f).catch(() => {
+						readFailed.push(f.path);
+						console.warn('[workbench] 读取失败', f.path);
+						return '';
+					}),
+				),
 			);
 			slice.forEach((file, idx) => {
 				const content = contents[idx];
 				if (!content) return;
-				if (scope === 'all' && !content.includes(this.settings.taskTag)) return;
+				// 全库档跳过不含 #action 的文件以省时间；但计划目录的文件要留——
+				// 它们即使没有任何 #action，也要进「安排」清单（计划页/总览依赖这些数据）。
+				if (scope === 'all' && !content.includes(this.settings.taskTag) && !this.isInPlanFolders(file)) {
+					return;
+				}
 
 				const lines = content.split('\n');
 				// 只有能从 frontmatter / 文件名取到日期，才算得上一场可计数的会议；
 				// 取不到日期的（如资料摘录）保留在列表中，但日期记为空。
 				const date = parseFrontmatterDate(content) || dateFromFilename(file.path);
+				// 无日期的来源在「本月/区间」档会被静默排除，先记数，渲染时如实提示。
+				// 计划目录（工作安排）本来就不按日期排除，不计入「未计入」。
+				if (!date && !this.isInPlanFolders(file)) noDateCount += 1;
 				// 会议的参会人员：任务没写 👤 时，「只看我的」靠它兜底判定。
 				// 库里有两个字段名——会议纪要用「参会人员」，工作安排用「参与人」，两个都收。
 				const attendees = parsePersonList(
@@ -2991,7 +3096,6 @@ class WorkbenchPlugin extends Plugin {
 					t.sourceDate = date;
 					t.sourceName = file.basename;
 					t.sourceAttendees = attendees;
-					t.hasCompletionNote = hasCompletionNoteBelow(lines, li);
 					fileTasks.push(t);
 				});
 				tasks.push(...fileTasks);
@@ -3079,6 +3183,9 @@ class WorkbenchPlugin extends Plugin {
 			rangeStart,
 			rangeEnd,
 			fileCount: files.length,
+			// 读失败的文件清单：渲染时在工具栏提示，避免「凭空少了几篇」而无人察觉
+			readFailed,
+			noDateCount,
 			meetings: visibleMeetings,
 			allMeetings: meetings,
 			tasks: visibleTasks,
@@ -3106,7 +3213,8 @@ class WorkbenchPlugin extends Plugin {
 			const content = await this.app.vault.cachedRead(file);
 			this.snapshots.set(file.path, content.split('\n'));
 		} catch (e) {
-			/* ignore */
+			// 读失败就没有基准快照，后续「勾选检测」会退化成按描述兜底；这里必须留痕
+			console.warn('[workbench] 快照失败', file.path, e);
 		}
 	}
 
@@ -3121,42 +3229,52 @@ class WorkbenchPlugin extends Plugin {
 	/* ------------------------ 勾选检测 ------------------------ */
 
 	async handleModify(file) {
-		if (this.internalWrite) return;
+		if (this.internalWrites > 0) return;
 		const oldLines = this.snapshots.get(file.path);
 		let content;
 		try {
 			content = await this.app.vault.read(file);
 		} catch (e) {
+			// 读盘失败也要让界面跟上（文件可能刚被外部删/移），不能静默 return
+			console.warn('[workbench] modify 读取失败', file.path, e);
+			this.invalidateCache();
 			return;
 		}
 		const newLines = content.split('\n');
 		this.snapshots.set(file.path, newLines);
 		if (!oldLines || !oldLines.length) {
 			this.invalidateCache();
-			this.refreshViews();
 			return;
 		}
 		if (!content.includes(this.settings.taskTag) || !this.settings.promptInEditor) {
 			this.invalidateCache();
-			this.refreshViews();
 			return;
 		}
 
-		const changed = findNewlyDoneChanges(oldLines, newLines, this.settings.taskTag);
-		if (changed.length) {
-			await this.handleEditorCompletion(file, changed[0], newLines);
+		const changed = findNewlyDoneChanges(
+			oldLines,
+			newLines,
+			this.settings.taskTag,
+			this.settings.completionLabel,
+		);
+		// 一次保存里可能勾了多项任务：必须逐项处理，只取 changed[0] 会静默丢掉其余记录。
+		// 串行执行即可——handleEditorCompletion 定位行是「内容匹配优先」，
+		// 前一项插入完成子行带来的行号偏移不影响后续项。
+		for (const task of changed) {
+			await this.handleEditorCompletion(file, task);
 		}
+		// 重绘交给调用方（flushModify 整批处理完统一 refreshViews），
+		// 这里逐文件 refreshViews 会把 N 个文件变成 N 次全量重扫。
 		this.invalidateCache();
-		this.refreshViews();
 	}
 
-	async handleEditorCompletion(file, task, newLines) {
+	async handleEditorCompletion(file, task) {
 		const note = await this.askCompletion(task, file.basename);
 
 		// 在笔记里勾选后点「取消」：还原成勾选前的原始行，不留下半完成状态
 		if (note === null) {
 			if (!task.prevLine && !task.prevStatus) return;
-			this.internalWrite = true;
+			this.internalWrites += 1;
 			try {
 				await this.processFile(file, (content) => {
 					const lines = content.split('\n');
@@ -3178,13 +3296,13 @@ class WorkbenchPlugin extends Plugin {
 			} catch (e) {
 				new Notice(`还原失败：${e.message}`);
 			} finally {
-				this.internalWrite = false;
+				this.internalWrites -= 1;
 			}
 			return;
 		}
 		const when = formatDateTime(new Date());
 		const line = buildCompletionNote(task.indent, when, note, this.settings.completionLabel);
-		this.internalWrite = true;
+		this.internalWrites += 1;
 		try {
 			await this.processFile(file, (content) => {
 				const lines = content.split('\n');
@@ -3198,7 +3316,7 @@ class WorkbenchPlugin extends Plugin {
 		} catch (e) {
 			new Notice(`记录完成情况失败：${e.message}`);
 		} finally {
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 	}
 
@@ -3224,6 +3342,21 @@ class WorkbenchPlugin extends Plugin {
 		return updated;
 	}
 
+	/**
+	 * 按描述兜底定位任务行。
+	 * 同描述的任务可能有多条（复制粘贴的常见），命中多条时宁可报错也不猜——
+	 * 猜错就改到了别的任务（曾经把别人那条标成已完成）。
+	 */
+	findUniqueTaskLine(lines, description) {
+		const hits = [];
+		lines.forEach((l, i) => {
+			const p = parseTaskLine(l, 0, this.settings.taskTag);
+			if (p && p.description === description) hits.push(i);
+		});
+		if (hits.length > 1) throw new Error('找到多条同名任务，请打开文件手动处理');
+		return hits.length === 1 ? hits[0] : -1;
+	}
+
 	async setTaskStatus(task, nextStatus) {
 		const file = task.file;
 		const now = new Date();
@@ -3239,17 +3372,16 @@ class WorkbenchPlugin extends Plugin {
 			}
 		}
 
-		this.internalWrite = true;
-		let newLine = null;
+		this.internalWrites += 1;
 		try {
 			await this.processFile(file, (content) => {
 				const lines = content.split('\n');
 				let idx = -1;
 				if (task.lineNumber >= 0 && lines[task.lineNumber] === task.rawLine) idx = task.lineNumber;
 				if (idx === -1) idx = lines.indexOf(task.rawLine);
-				if (idx === -1) idx = lines.findIndex((l) => parseTaskLine(l, 0, this.settings.taskTag) && parseTaskLine(l, 0, this.settings.taskTag).description === task.description);
+				if (idx === -1) idx = this.findUniqueTaskLine(lines, task.description);
 				if (idx === -1) throw new Error('未找到任务行，文件可能已被改动');
-				newLine = applyStatusChange(lines[idx], nextStatus, {
+				lines[idx] = applyStatusChange(lines[idx], nextStatus, {
 					doneDate: formatDate(now),
 					// 「未开始」= 开始日期在未来，因此转未开始时必须写一个未来日期（明天）
 					// 「进行中」按设置决定是否记录今天的开始日期
@@ -3260,24 +3392,28 @@ class WorkbenchPlugin extends Plugin {
 								? formatDate(now)
 								: null,
 				});
-				lines[idx] = newLine;
-				const finalLines = nextStatus === STATUS.DONE ? lines : removeCompletionNotes(lines, idx);
-				return finalLines.join('\n');
+				if (nextStatus !== STATUS.DONE) {
+					return removeCompletionNotes(lines, idx, this.settings.completionLabel).join('\n');
+				}
+				// 已完成：完成子行在**同一次写入**里插好。分两次 processFile 会留下
+				// 「符号已翻成 ✅、子行还没插」的中间态（另一处读到就会误判/丢文字）。
+				if (note) {
+					const line = buildCompletionNote(
+						task.indent,
+						formatDateTime(now),
+						note,
+						this.settings.completionLabel,
+					);
+					// 手工取消勾选（子行被留下）后再完成时，先清掉旧子行，保证只有一条
+					const cleaned = removeCompletionNotes(lines, idx, this.settings.completionLabel);
+					return insertAfterTaskBlock(cleaned, idx, line).join('\n');
+				}
+				return lines.join('\n');
 			});
 			await this.snapshotFile(file);
 
 			if (nextStatus === STATUS.DONE && this.settings.promptInView) {
 				if (note) {
-					const when = formatDateTime(now);
-					const line = buildCompletionNote(task.indent, when, note, this.settings.completionLabel);
-					await this.processFile(file, (content) => {
-						const lines = content.split('\n');
-						let idx = lines.indexOf(newLine);
-						if (idx === -1) idx = lines.findIndex((l) => parseTaskLine(l, 0, this.settings.taskTag) && parseTaskLine(l, 0, this.settings.taskTag).description === task.description);
-						if (idx === -1) throw new Error('未找到任务行');
-						return insertAfterTaskBlock(lines, idx, line).join('\n');
-					});
-					await this.snapshotFile(file);
 					new Notice('任务已完成，并记录了完成情况');
 				} else {
 					new Notice('任务已完成');
@@ -3294,7 +3430,7 @@ class WorkbenchPlugin extends Plugin {
 		} catch (e) {
 			new Notice(`更新任务失败：${e.message}`);
 		} finally {
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 		this.invalidateCache();
 		this.refreshViews();
@@ -3302,9 +3438,9 @@ class WorkbenchPlugin extends Plugin {
 
 	/* --------------------------- 其他 --------------------------- */
 
-	/** 新建一条工作安排：<工作安排目录>/YYYY-MM-DD-事件.md */
+	/** 新建一条工作安排：04-Operations/YYYY-MM-DD-事件.md */
 	async createArrangement(input) {
-		const folder = firstFolder(this.settings.planFolders, DEFAULT_PLAN_FOLDER).replace(/\/+$/, '');
+		const folder = (this.settings.planFolders || ['04-Operations'])[0].replace(/\/+$/, '');
 		const date = input.date;
 		const base = `${date}-${sanitizeFileName(input.title)}`;
 		let path = `${folder}/${base}.md`;
@@ -3313,16 +3449,27 @@ class WorkbenchPlugin extends Plugin {
 			path = `${folder}/${base}-${n}.md`;
 			n += 1;
 		}
+		let file = null;
 		try {
 			const content = buildArrangementNote(input);
-			const file = await this.app.vault.create(path, content);
+			file = await this.app.vault.create(path, content);
 			await this.snapshotFile(file);
 			this.invalidateCache();
 			this.refreshViews();
 			new Notice(`已创建安排：${file.path}`);
-			this.app.workspace.getLeaf(false).openFile(file);
 		} catch (e) {
 			new Notice(`创建安排失败：${e.message}`);
+			return;
+		}
+		// 打开文件失败 ≠ 创建失败：文件已经建好了，别让用户以为要重来一次
+		try {
+			const p = this.openFile(file);
+			if (p && typeof p.catch === 'function') {
+				p.catch(() => new Notice('文件已创建，但打开失败'));
+			}
+		} catch (e) {
+			console.warn('[workbench] 打开新建安排失败', e);
+			new Notice('文件已创建，但打开失败');
 		}
 	}
 
@@ -3332,19 +3479,26 @@ class WorkbenchPlugin extends Plugin {
 		const oldPath = item.file.path;
 		// 日期或事件名称变了 → 文件名跟着变，保持 `YYYY-MM-DD-事件.md` 一致
 		const newPath = nextPlanPath(item, input, (p) => Boolean(this.app.vault.getAbstractFileByPath(p)));
-		this.internalWrite = true;
+		this.internalWrites += 1;
+		// 阶段标记：正文已写成功、只是改名失败时不能报「修改失败」（会误导用户重做一遍）
+		let phase = 'content';
 		try {
 			await this.processFile(item.file, (content) => rewriteArrangementNote(content, input));
 			if (newPath !== oldPath) {
+				phase = 'rename';
 				await this.app.fileManager.renameFile(item.file, newPath);
 				this.snapshots.delete(oldPath);
 			}
 			await this.snapshotFile(this.app.vault.getAbstractFileByPath(newPath) || item.file);
 			new Notice('已保存修改');
 		} catch (e) {
-			new Notice(`修改失败：${e.message}`);
+			new Notice(
+				phase === 'rename'
+					? `正文已更新，但改名失败（请手动调整文件名）：${e.message}`
+					: `修改失败：${e.message}`,
+			);
 		} finally {
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 		this.invalidateCache();
 		this.refreshViews();
@@ -3353,7 +3507,7 @@ class WorkbenchPlugin extends Plugin {
 	/** 修改一条任务的描述/执行人/截止/优先级（不动状态与完成信息） */
 	async updateTask(task, edits) {
 		if (!task || !task.file) return;
-		this.internalWrite = true;
+		this.internalWrites += 1;
 		let ok = false;
 		try {
 			await this.processFile(task.file, (content) => {
@@ -3361,12 +3515,7 @@ class WorkbenchPlugin extends Plugin {
 				let idx = -1;
 				if (task.lineNumber >= 0 && lines[task.lineNumber] === task.rawLine) idx = task.lineNumber;
 				if (idx === -1) idx = lines.indexOf(task.rawLine);
-				if (idx === -1) {
-					idx = lines.findIndex((l) => {
-						const p = parseTaskLine(l, 0, this.settings.taskTag);
-						return p && p.description === task.description;
-					});
-				}
+				if (idx === -1) idx = this.findUniqueTaskLine(lines, task.description);
 				if (idx === -1) throw new Error('未找到任务行，文件可能已被改动');
 				const next = applyTaskEdits(lines[idx], edits, this.settings.taskTag);
 				if (next === lines[idx]) return content;
@@ -3379,7 +3528,7 @@ class WorkbenchPlugin extends Plugin {
 		} catch (e) {
 			new Notice(`修改失败：${e.message}`);
 		} finally {
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 		this.invalidateCache();
 		this.refreshViews();
@@ -3388,7 +3537,12 @@ class WorkbenchPlugin extends Plugin {
 
 	/** 顺延安排：改文件名日期 + frontmatter date + 正文时间行 */
 	async shiftArrangement(item, days) {
-		if (!item || !item.file || !item.date) return;
+		if (!item || !item.file) return;
+		// 无日期的安排（文件名/日期都没解析出来）没法算「＋1 天」，静默 no-op 会让人以为按钮坏了
+		if (!item.date) {
+			new Notice('该安排未排期，请先补充日期');
+			return;
+		}
 		const next = addDays(item.date, days);
 		const folder = item.path.slice(0, item.path.lastIndexOf('/') + 1);
 		const base = parsePlanFileName(item.fileName) || { title: item.title };
@@ -3398,25 +3552,35 @@ class WorkbenchPlugin extends Plugin {
 			newPath = `${folder}${next}-${base.title}-${n}.md`;
 			n += 1;
 		}
-		this.internalWrite = true;
+		this.internalWrites += 1;
+		// 阶段标记：正文写完、改名失败要分开报
+		let phase = 'content';
 		try {
+			// rename 会**原地改写** item.file.path，所以旧路径必须在改名之前取
+			const oldPath = item.file.path;
 			await this.processFile(item.file, (content) =>
 				content
 					.replace(/^date:\s*\d{4}-\d{2}-\d{2}/m, `date: ${next}`)
 					.replace(/^modified:\s*.*$/m, `modified: ${formatDateTime(new Date()).replace(' ', 'T')}:00+08:00`)
 					.replace(new RegExp(`(\\*\\*时间\\*\\*：)${item.date}`), `$1${next}`),
 			);
-			if (newPath !== item.path) {
+			if (newPath !== oldPath) {
+				phase = 'rename';
 				await this.app.fileManager.renameFile(item.file, newPath);
 			}
-			this.snapshots.delete(item.path);
+			// 删的是旧路径的快照（改名后 item.path 已被改写成新路径，直接删会删错键）
+			this.snapshots.delete(oldPath);
+			// 对齐 updateArrangement：改名后按新路径重新取文件再快照
+			await this.snapshotFile(this.app.vault.getAbstractFileByPath(newPath) || item.file);
 			this.invalidateCache();
 			this.refreshViews();
 			new Notice(`已顺延到 ${next}`);
 		} catch (e) {
-			new Notice(`顺延失败：${e.message}`);
+			new Notice(
+				phase === 'rename' ? `内容已更新，但改名失败：${e.message}` : `顺延失败：${e.message}`,
+			);
 		} finally {
-			this.internalWrite = false;
+			this.internalWrites -= 1;
 		}
 	}
 
@@ -3427,13 +3591,30 @@ class WorkbenchPlugin extends Plugin {
 			return;
 		}
 		const leaf = this.app.workspace.getRightLeaf(false);
+		// 右侧没有可用 leaf（侧栏被占满/已关闭）时直接返回，否则 setViewState 会抛空引用
+		if (!leaf) return;
 		await leaf.setViewState({ type: VIEW_TYPE_WORKBENCH, active: true });
 		this.app.workspace.revealLeaf(leaf);
 	}
 
+	/**
+	 * 打开文件（可定位到行）。
+	 * 返回 openFile 的 promise（没有则 null）供调用方追加提示；内部只记日志，不抛。
+	 */
 	openFile(file, line) {
-		const leaf = this.app.workspace.getLeaf(false);
-		leaf.openFile(file, line != null ? { eState: { line, scroll: line } } : undefined);
+		let ret = null;
+		try {
+			const leaf = this.app.workspace.getLeaf(false);
+			if (!leaf) return null;
+			ret = leaf.openFile(file, line != null ? { eState: { line, scroll: line } } : undefined);
+		} catch (e) {
+			console.warn('[workbench] 打开文件失败', file && file.path, e);
+			return null;
+		}
+		if (ret && typeof ret.catch === 'function') {
+			ret.catch((e) => console.warn('[workbench] 打开文件失败', file && file.path, e));
+		}
+		return ret;
 	}
 }
 
@@ -3473,7 +3654,7 @@ class WorkbenchSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('会议目录')
-			.setDesc('每行一个仓库相对路径；这些目录里的 .md 一律算会议。首次安装为空，请填成你自己的会议目录。')
+			.setDesc('每行一个仓库相对路径，工作台只统计这些目录下的会议与行动项。')
 			.addTextArea((t) => {
 				t.inputEl.rows = 4;
 				t.setValue((this.plugin.settings.meetingFolders || []).join('\n'));
@@ -3535,7 +3716,7 @@ class WorkbenchSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Calendar 过去日期落位目录')
-			.setDesc('日期早于今天时，把它改名成 `YYYY-MM-DD-会议.md` 放这里。留空则该分支不生效。')
+			.setDesc('日期早于今天时，把它改名成 `YYYY-MM-DD-会议.md` 放这里。默认 `02-Business/1.会议`。')
 			.addText((t) =>
 				t.setValue(this.plugin.settings.calendarMeetingFolder || '').onChange(async (v) => {
 					this.plugin.settings.calendarMeetingFolder = v.trim();
@@ -3682,8 +3863,6 @@ module.exports.buildDailyNote = buildDailyNote;
 module.exports.buildMeetingDayNote = buildMeetingDayNote;
 module.exports.isPlanFile = isPlanFile;
 module.exports.isExcludedSourcePath = isExcludedSourcePath;
-module.exports.resolveExcludeFolders = resolveExcludeFolders;
-module.exports.firstFolder = firstFolder;
 module.exports.isSourcePathForScope = isSourcePathForScope;
 module.exports.parseArrangement = parseArrangement;
 module.exports.buildArrangementNote = buildArrangementNote;
@@ -3711,6 +3890,7 @@ module.exports.countByStatus = countByStatus;
 module.exports.isOverdueTask = isOverdueTask;
 module.exports.filterByMeeting = filterByMeeting;
 module.exports.filterOverdue = filterOverdue;
-module.exports.STATUS = STATUS;
 module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
+module.exports.STATUS = STATUS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;
+module.exports.compareMeetingsByDateDesc = compareMeetingsByDateDesc;

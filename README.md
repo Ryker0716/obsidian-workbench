@@ -1,253 +1,146 @@
-# 工作台（Workbench）
+# 工作台（workbench）
 
-[中文](README.md) | [English](README.en.md)
+本库自研的 Obsidian 本地插件。用户使用说明见
+`03-Personal/1.知识体系/2.工具使用/工作台插件使用说明.md`。
 
-一个 Obsidian 插件：**统计会议次数、汇总会议行动项、管理未来工作安排**，并让「勾选完成」这件事带上完成情况记录。
+## 文件
 
-> [!note] 为什么会有这个插件
-> Obsidian 有很多任务插件（Tasks、Dataview 等），但没有一个能在你勾选任务时**停下来问你一句「这事完成得怎么样」**，也没有一个能按「本月开了几次会」这个口径直接把会议和行动项摆在一屏里。工作台补的就是这两块：**按会议/项目维度看行动项**，以及**完成后自动记录完成时间 + 完成情况**。
+| 文件 | 说明 |
+| --- | --- |
+| `manifest.json` | 插件清单（id: `workbench`） |
+| `main.js` | 全部逻辑，纯 CommonJS，无构建步骤，改完直接「重新加载插件」 |
+| `styles.css` | 样式，使用 Obsidian CSS 变量，跟随主题 |
+| `data.json` | 运行期生成的设置，首次保存设置后出现 |
 
-## 截图
+## 结构
 
-**回顾**：顶部统计卡（可点击筛选） + 本月会议列表 + 三栏看板
+```
+main.js
+├── 纯函数区（可脱离 Obsidian 单测）
+│   ├── parseTaskLine / cleanDescription / statusFromSymbol
+│   ├── applyStatusChange / structDepth / findChildBlockEnd
+│   ├── insertAfterTaskBlock / removeCompletionNotes / hasCompletionNoteBelow
+│   ├── findNewlyDoneChanges
+│   └── parseFrontmatterDate / dateFromFilename / isInMonth
+├── CompletionModal        # 完成情况询问框
+├── WorkbenchView          # 三栏看板视图
+├── WorkbenchPlugin        # 插件主体：扫描、快照、写回
+└── WorkbenchSettingTab    # 设置页
+```
 
-![回顾页](docs/screenshot-review.png)
+纯函数通过 `module.exports.<name>` 挂到导出类上，便于用 Node 存根测试。
 
-**计划**：未来工作安排按日期分组，底部附带会议/项目里排到未来的待办
+## 关键设计
 
-![计划页](docs/screenshot-plan.png)
+- **所有范围共用同一条排除规则** `isSourcePathForScope(path, scope, settings)`：先过
+  `isExcludedSourcePath()`，再按范围判断目录。**曾漏用于「全库」档**，导致仓库根 `AGENTS.md`
+  里 Tasks 语法示例（`#action 待办任务 📅 2026-03-15`）被当成真任务。`isSourceFile()` 与 `scan()`
+  现在都委托同一个纯函数，不会再有第二套逻辑。
+- **三类扫描目录共用同一条排除规则** `isExcludedSourcePath()`：排除目录、`assets/`、以及
+  `AGENTS`/`README`（仅空格、下划线、点或结尾分隔）与精确的 `说明.md`/`索引.md`。
+  曾因 `isInPlanFolders` 漏用该规则，导致 `04-Operations/AGENTS.md` 被当成文档计数；
+  规则对 `说明会记录.md`、`README-项目.md` 这类正文名**不误伤**（宁可少排除，不可误删）。
+- **三个页签**：`state.tab` 为 `overview`（总览，默认）、`plan`（未来工作安排）、
+  `review`（会议/项目行动项三栏看板）。页签不进扫描缓存键，切换只重绘。
+  总览把「安排」与「到期待办」按日期合并成时间线，指标卡用 `goTab()` 跳到对应页签。
+  总览的待办来自 `snapshot.allTasks`（未按范围过滤），因为总览需要跨月视野。
+- **一个安排 = 一个笔记**：写在 `planFolders`（默认 `04-Operations`）下的
+  `YYYY-MM-DD-事件.md`，frontmatter `二级分类: 工作安排`，符合仓库 AGENTS.md §3。
+  识别见 `isPlanFile()` / `parsePlanFileName()`，生成见 `buildArrangementNote()`。
+- **Calendar 自动落位**（`handleDailyNoteCreated`）：Calendar 插件只能配一个目录，
+  没有按日期分支的能力，所以本插件在 vault `create` 事件里接手它生成的
+  `04-Operations/YYYY-MM-DD-工作安排.md`：`日期 >= 今天` 就地填成一条**普通工作计划**
+  （`buildDailyNote()` 直接复用 `buildArrangementNote()`，两者逐字节一致，
+  这就是用户要的「与计划文件完全一致」；`kind: 'plan'` 而非独立类型，
+  文件留在 `04-Operations`，进计划页）；`日期 < 今天` 改名 `YYYY-MM-DD-会议.md` 移入
+  `calendarMeetingFolder`，套用 `calendarMeetingTemplate`（`renderMeetingTemplate()`
+  替换 `<% tp.date.now() %>`、硬编码的 `modified`、并补 `#action` 占位与 H1 标题）。
+  目标路径由纯函数 `dailyNoteTargetPath()` 计算（基础名见 `dailyFileBase()`），重名自动 `-2`/`-3`。
+  **踩过的坑**：`fileManager.renameFile()` 会**原地改写** `TFile.path`，因此 busy 去重键
+  必须在改名**之前**取出存好、在 `finally` 里用该原始键删除；否则 `delete(file.path)`
+  删的是新路径，旧键永久泄漏，后续同名创建事件被静默吞掉（表现为「重复点击过去日期
+  不再生成 `-2`」）。另外 `daily-notes.json` 的 `format` 必须与 `DAILY_NAME_RE` 一致，
+  插件只接管 `YYYY-MM-DD-工作安排`（正则仍兼容历史遗留的 `-日报` 后缀）。
+- **时间用 `⏰ HH:mm`**：Tasks 插件不认这个符号，会当普通描述文字忽略，因此不影响它对
+  `📅` 的解析；插件侧 `parseTimeMarker()` 取出时间。
+  frontmatter 的 `时间` **必须加引号**（YAML 1.1 会把 `10:00` 解析成 600）。
+- **时间分组**：`timeBucket()` 把安排分为 今天/明天/本周内/下周/本月内/更远/未排期/已过去，
+  周一为一周之首。
+- **两类扫描目录**：`meetingFolders`（会议目录，文件一律算会议）+ `extraFolders`（附加目录，
+  如商机/项目：`#action` 进看板，但只有 frontmatter 带 `会议类别` 的才算会议，见
+  `isMeetingRecord()` / `frontmatterHasField()`）。任务按**来源文件日期**圈定范围，
+  所以附加目录里方案/入口文档的待办也能出现在本月看板。
+- **统计卡即筛选器**：`renderHeader()` 把五张卡渲染成 `<button>`，点击时只改视图状态
+  （`scope` / `statusFilter`）并由 `applyFilter()` 重绘。`statusFilter` **不进**扫描缓存键，
+  所以点状态卡不触发重新扫描，瞬时响应；只有 `scope` 变化才重扫。
+- **会议行状态小标签同时锁会议**：会议行右侧的「进行中 7」如果只设 `statusFilter`，
+  看板会拉出**全库**所有进行中的任务（几百项），而不是这一场的 7 项。所以点小标签时
+  同时写 `meetingFilter`（会议文件路径）与 `statusFilter`，由纯函数
+  `filterByMeeting(snapshot, meetingPath, onlyMine, now)` 收窄快照：`tasks` 只留这场会议的，
+  `allTasks` 同步收窄供下游复用，并把 `monthTaskCount` / `monthMeetingCount`
+  改成本场口径（`inMonth.length` / 1），避免两张本月卡与看板打架。三处退出入口：
+  会议行小标签再点一次、工具条 chip 的 `×`、清单标题的「显示全部会议」；
+  点上方统计卡或切换「范围」也会顺带清掉 `meetingFilter`。与 `statusFilter` 一样**不进**缓存键。
+- **扫描缓存键**：统一由 `viewCacheKey(state)` 生成，含 `scope|search|rangeStart|rangeEnd`。
+  时间区间参与扫描（在 `scan()` 里过滤），因此改日期会重扫；状态筛选只在渲染层过滤。
+- **「只看我的」**：`taskInvolvesMe(task, selfNames)` 是纯函数。任务写了 `👤` → 只看执行人；
+  没写 `👤` → 退回它所在文件的 `参会人员` / `参与人`（会议纪要与工作安排用了两个不同字段名，
+  两个都收）。`scan()` 给每条任务打 `mine` 标记，开关本身**不进缓存键**，点按钮只重绘不重扫，
+  与 `statusFilter` 同一套路。开启时 `applyMine()` 用浅拷贝收窄快照，并把
+  `monthMeetingCount` / `monthTaskCount` 换成 `mineMonth*`，让五张卡同步收窄，避免数字与看板打架。
+- **自选时间范围**：`scope === 'range'` 时用 `inDateRange()` 按闭区间圈会议，起止倒填自动交换，
+  未给日期时回落到「本月 1 日 ~ 今天」。
+- **先确认后落盘**：`setTaskStatus()` 在目标状态为 `done` 时**先** `askCompletion()`，
+  返回 `null`（取消）就直接 return，一个字节都不写。编辑器路径（`handleEditorCompletion`）
+  取消时用 `task.prevLine`（由 `findNewlyDoneChanges()` 带出）把那行还原成改动前的内容。
+- **卡片勾选框**：`renderCard()` 在标题左侧渲染 `input[type=checkbox]`，勾选走
+  `setTaskStatus(task, DONE)`（含完成时间与完成情况询问），取消走 `DOING`（撤销完成）。
+  样式用 `input.wb-card-check[type="checkbox"]` 提高优先级——否则会被 Obsidian 全局复选框
+  样式盖成 21px。
+- **三态是推导的**：`deriveStatus(symbolStatus, startDate, today)`。`[x]`/`[-]`/`[/]` 照符号走；
+  未勾选的 `[ ]` 只有「`🛫` 在未来」才算 `todo`，没有 `🛫` 或 `🛫` 已到都算 `doing`。
+  因此「转为未开始」必须写入一个未来日期（取最小未来日 = 明天，见 `tomorrowOf()`），
+  否则会被立刻重判为进行中。原始符号状态保留在 `symbolStatus` 字段，便于排查。
+- **任务格式**：`- [ ] #action 内容 👤执行人 📅 截止 ➕ 创建`，兼容 Tasks 插件的
+  自定义状态（`/` = In Progress）。
+- **引用块支持**：`TASK_LINE_RE` 允许 `> - [ ] #action …` 形式；
+  `structDepth()` 把 `>` 层级折算成缩进宽度，保证子行归属正确。
+- **完成时间**：任务行只写标准 `✅ YYYY-MM-DD`（Tasks 可解析），精确到分钟的
+  完成时间写在任务下方的缩进子行 `- ✅ YYYY-MM-DD HH:mm 完成情况：…`。
+- **两处「修改」按钮**：计划页改安排本身（`updateArrangement` + `rewriteArrangementNote`），
+  回顾页改任务四要素（`updateTask` + `applyTaskEdits`）。设计上都走「摘出不可编辑标记 →
+  只替换目标字段 → 按固定顺序重排」，因此状态、🛫/✅/➕、完成情况子行一律不受影响。
+- **改名规则**：`nextPlanPath(item, input, exists)` 是纯函数，**日期或事件名称任一变化**
+  都重命名文件以符合 `YYYY-MM-DD-事件.md`（重名加 `-2`，标题过 `sanitizeFileName`）。
+  修这个 bug 之前的写法只在日期变化时改名，导致「只改名称」时 `# 标题` 已更新、
+  文件名没动——而 `parseArrangement` 的 title 取自文件名，于是看板上看起来「改名称失败」。
+- **面板折叠**：计划页两个面板（未来工作安排 / 未来待办）的展开收起状态存在
+  `view.state.planCollapsed` / `upcomingCollapsed`，**不进 DOM 局部变量**——早期写法用
+  `let collapsed = false`，任何一次 `refreshViews()` 都会把它重置成展开。
+- **编辑器勾选检测**：维护「文件路径 → 行数组」快照，`vault.on('modify')` 时用
+  `findNewlyDoneChanges()` 对比，识别「刚被勾选完成」的任务；写回期间用
+  `internalWrite` 标志避免自触发。
+- **撤销清理**：撤销完成时用 `removeCompletionNotes()` 删除插件写入的子行，
+  使再次完成能重新询问。
+- **外部改动刷新**：`create` / `delete` / `rename` 三个事件都走 `refreshViews()`
+  （250ms 防抖），只 `invalidateCache()` 不重绘是曾经的 bug——手动往
+  `04-Operations` 丢一个文件进去，看板要等到下次交互才更新。`create` 时顺便
+  `snapshotFile()`，否则新文件的第一次勾选会被当成「无快照」而跳过完成询问。
 
-**总览**：今天 · 明天要做什么
+## 本地测试
 
-![总览页](docs/screenshot-overview.png)
-
-**完成确认框**：勾选后先确认，再记录完成情况
-
-![完成确认框](docs/screenshot-completion.png)
-
-**首次安装引导**：告诉插件你的目录在哪
-
-![首次安装引导](docs/screenshot-onboarding.png)
-
-## 功能
-
-三个页签：
-
-| 页签 | 做什么 |
-|------|--------|
-| **总览** | 今天 · 明天要做什么：把「工作安排」和「到期待办」合成一条时间线 |
-| **计划** | 未来的工作安排，按具体日期分组；底部附带会议/项目里排到未来的待办 |
-| **回顾** | 会议与项目里的行动项，按未开始 / 进行中 / 已完成三栏看板 |
-
-具体能力：
-
-- **本月会议统计** —— 顶部统计卡显示本月会议数、本月行动项、进行中、已完成、已逾期；**卡片可点击**，点一下就把下方看板筛成对应口径。
-- **已逾期透视** —— 过截止期但还没做完的任务，往往挂在**过去的会议**里，按范围查不到。点「已逾期」卡（或总览页的「查看逾期清单」）即可跨范围拉出全部逾期任务，按过期时间排序，一眼看清最该先处理什么。
-- **会议清单可直接下钻** —— 会议行右侧的 `进行中 2` 是可点的：点一下只看**这一场会议里该状态的 2 项**，而不是全库同类任务。被锁定的会议行会高亮，工具条出现「会议：xxx ×」标签，点任意一处即可还原。
-- **行动项看板** —— 未开始 / 进行中 / 已完成三栏。判断规则：`🛫 开始日期` 在未来才算「未开始」，**没写开始日期的一律算「进行中」**。
-- **勾选即记录** —— 在看板里勾选任务后，插件**先弹出确认框**（点「取消」不会改动笔记一个字节），确认后写入标准 `✅ YYYY-MM-DD`，并询问完成情况，把回答记成任务下方的一行子备注。
-- **在笔记里直接勾选也能捕获** —— 编辑器里把 `- [ ]` 改成 `- [x]`，同样会触发确认框。
-- **时间范围可自选** —— 本月 / 自定义起止 / 全部会议 / 全库，互不干扰。
-- **只看我的** —— 一键筛出执行人（或参会人）是自己的任务；在设置里告诉插件「我是谁」。
-- **未来工作安排** —— 在插件内直接录入（事件名/日期/时间/地点/参与人/要点），生成 `YYYY-MM-DD-事件.md`；支持「＋1 天」顺延、修改、折叠面板。
-- **Calendar 联动** —— 在 Calendar 插件里点某个日期，新建的日记文件会被自动改名 + 填入骨架，并按日期落在不同目录（详见下文）。
-
-## 安装
-
-本插件是纯 JavaScript、**没有构建步骤**，`main.js` 就是可直接加载的产物。
-
-### 手动安装
-
-1. 下载本仓库，或 `git clone`。
-2. 在你的库（vault）里建目录 `<你的库>/.obsidian/plugins/workbench/`。
-3. 把 `main.js`、`manifest.json`、`styles.css` 三个文件拷进去。
-4. Obsidian → 设置 → 第三方插件 → 关闭「安全模式」（如开启）→ 刷新 → 启用「工作台」。
+Node 存根 + 真实仓库数据（不依赖 Obsidian）：
 
 ```bash
-# 在库根执行（把路径换成你自己的库）
-git clone https://github.com/Ryker0716/obsidian-workbench.git /tmp/obsidian-workbench
-mkdir -p .obsidian/plugins/workbench
-cp /tmp/obsidian-workbench/{main.js,manifest.json,styles.css} .obsidian/plugins/workbench/
+mkdir -p /tmp/wb-test/node_modules/obsidian   # 放入 obsidian API 存根
+NODE_PATH=/tmp/wb-test/node_modules node /tmp/wb-test/test.js
 ```
 
-### 修改后如何生效
+测试覆盖：任务行解析（含引用块）、状态改写、子行插入与边界、勾选检测、
+日期解析、全仓扫描计数与 grep 对齐、撤销清理、真实文件写回 dry-run。
 
-改完 `main.js` 后，在 Obsidian 里执行命令 `插件: 重新加载`（或 `Ctrl/Cmd+R` 重载应用），不需要重启。
+## 修改后如何生效
 
-## 首次使用：告诉插件你的目录
-
-插件**不知道你的会议记录放在哪**，所以第一次打开会看到引导页。三种方式：
-
-| 预设 | 效果 |
-|------|------|
-| **创建推荐目录结构** | 在库根新建 `会议/`、`项目/`、`计划/` 并自动配好，适合从零开始或先试用 |
-| **使用我已有的目录** | 跳过引导，直接去 设置 → 工作台 填你的真实路径 |
-| **稍后再说** | 什么都不配，随时可补 |
-
-推荐目录结构：
-
-```
-会议/     ← 会议纪要（这些目录里的 .md 一律算会议）
-项目/     ← 项目文档（里面的 #action 也进看板；只有带 `会议类别` 的才算会议）
-计划/     ← 未来工作安排，一个安排一个笔记：YYYY-MM-DD-事件.md
-```
-
-> [!warning] 装了插件但什么都没配会怎样
-> 「回顾」页会是空的。这不是坏了，是还没告诉插件去哪里找。去 设置 → 工作台 填「会议目录」即可。
-
-## 任务格式
-
-沿用的是 Tasks 插件的 emoji 格式，所以**可以和 Tasks 插件共存**：
-
-```markdown
-- [ ] #action 未完成任务 ➕ 2026-03-04
-- [x] #action 已完成任务 ✅ 2026-03-04
-
-- [ ] #action 带截止日期 📅 2026-03-15 ➕ 2026-03-04
-- [ ] #action 高优先级 📅 2026-03-10 🔺 ➕ 2026-03-04
-
-- [ ] #action 有执行人 👤[[张三]] 📅 2026-03-15
-- [ ] #action 还没开始 🛫 2026-04-01
-```
-
-| 标记 | 含义 |
-|------|------|
-| `#action` | 任务标签（可改，见「任务标签」设置） |
-| `📅` | 截止日期 |
-| `➕` | 创建日期 |
-| `🛫` | 开始日期 —— **在未来才是「未开始」** |
-| `✅` | 完成日期（插件勾选时自动写入，格式为 `YYYY-MM-DD`，保持 Tasks 可解析） |
-| `👤` | 执行人（支持 `👤[[张三]]` 或 `👤 张三`） |
-| `⏰` | 具体时间，如 `⏰ 10:30`（用于工作安排；Tasks 插件不认识这个符号，会当普通文字忽略，互不干扰） |
-| `🔺 ⏫ 🔼` | 优先级 |
-
-引用块（callout）里的任务也能被识别：
-
-```markdown
-> [!todo] 会上定的
-> - [ ] #action 引用块里的任务 👤[[张三]] 📅 2026-09-30
-```
-
-## 完成流程
-
-这是本插件最主要的设计：**勾选 ≠ 立刻完成**。
-
-1. 在看板里勾选任务，或在笔记里把 `- [ ]` 改成 `- [x]`。
-2. 弹出确认框，标题「确认完成任务」，提示：
-
-   > 点「确认完成」才会真的完成任务；点「取消」任务保持原样，不会改动笔记。
-
-3. 框里有「快捷选项」（可在设置里改，默认：已按时完成 / 部分完成 / 延期完成 / 受阻待跟进）和一个文本框。
-4. 点「确认完成」后写入：
-
-   ```markdown
-   - [x] #action 签署保密协议 👤[[张三]] 📅 2026-09-03 ✅ 2026-10-12
-   		- ✅ 2026-10-12 12:03 完成情况：已按时完成
-   ```
-
-   —— 任务行保留标准的 `✅ YYYY-MM-DD`（Tasks 插件可正常解析），**精确到分钟的时间写在完成情况子行里**。
-5. 点「取消」：**什么都不写**，任务回到原状态；取消勾选时，已写入的 `✅` 和完成情况子行会被一并清除。
-
-## 设置项
-
-设置 → 第三方插件 → 工作台：
-
-| 设置 | 说明 |
-|------|------|
-| **我是谁** | 「只看我的」判定用：填自己的姓名/别名，多个用顿号或换行分隔。留空则该按钮禁用 |
-| **会议目录** | 每行一个仓库相对路径；这些目录里的 `.md` 一律算会议 |
-| **附加目录** | 里面的 `#action` 也进看板；其中只有带 `会议类别` 的才算会议、计入会议数 |
-| **工作安排目录** | 一个安排一个笔记：`YYYY-MM-DD-事件.md` |
-| **Calendar 自动落位** | 开关。接管 Calendar 点出来的日记文件 |
-| **Calendar 过去日期落位目录** | 日期早于今天时，改名成 `YYYY-MM-DD-会议.md` 放这里。留空则该分支不生效 |
-| **会议纪要模版** | 落位时用它生成会议笔记（会替换其中的 Templater 日期语法）。留空则用内置结构 |
-| **排除目录** | 每行一个；这些目录下的文件不参与扫描 |
-| **任务标签** | 只收集包含该标签的复选框行，默认 `#action` |
-| **开始任务时写入开始日期** | 把任务转为「进行中」时，是否顺手写 `🛫 今天` |
-| **看板中完成后询问完成情况** | 针对看板勾选 |
-| **笔记中勾选后询问完成情况** | 针对编辑器内勾选 |
-| **完成情况标签** | 子行里 `完成情况：` 这个标签名 |
-| **快捷选项** | 确认框里的预设按钮 |
-| **默认范围** | 打开工作台时默认用哪个范围 |
-
-### 关于「排除目录」的推导
-
-「排除目录」默认留空，但有两类文件**始终**不会被扫描，无需手动配置：
-
-- `assets/` 下的附件、`AGENTS.md` / `README.md` / `说明.md` / `索引.md` 这类非正文文件；
-- 你配置的**会议纪要模版**本身（否则模版里的示例待办会被统计进去）。
-
-推导是只读的：改了模版位置后，旧位置的排除会立刻失效，不会残留成僵尸配置。
-
-## Calendar 联动
-
-Obsidian 核心的「日记」（Daily notes）和 Calendar 插件**只能配一个目录、没有按日期分支的能力**。开启「Calendar 自动落位」后，工作台会接管：
-
-| 你点的日期 | 结果 |
-|-----------|------|
-| 早于今天 | 改名成 `YYYY-MM-DD-会议.md`，落到「Calendar 过去日期落位目录」，用会议纪要模版填好 |
-| 今天或未来 | 留在「工作安排目录」，名为 `YYYY-MM-DD-工作安排.md`，生成计划文件骨架 |
-
-重复点同一个过去日期不会覆盖已有记录，而是自动建 `-2`、`-3`。
-
-要让 Calendar 生成的文件名与插件期望的一致，还需把核心「日记」设置调成这样：
-
-- 日记的**新建文件位置** → 你的工作安排目录
-- 日记的**日期格式** → `YYYY-MM-DD-工作安排`
-
-## 配套的 Bases 视图（可选）
-
-如果你用核心的 [Bases](https://help.obsidian.md/bases) 插件，可以再建一个 `.base` 把会议和工作安排也列成表格。注意 Bases 的两个坑：
-
-- `file.inFolder()` **不能写在 `if()` 的分支里**，否则整条公式失效、视图 0 行；应写在公式外的 `||` 组合里，或直接放进 view 的 `filters` 用 `or:`。
-- 判断 frontmatter 字段**是否存在**，要用裸字段名（`- '会议类别'`）；`会议类别 != null` 和 `会议类别 != ""` 都判断不出来。
-
-## 开发与测试
-
-零依赖、无构建。测试跑在合成的假库上，**不需要 Obsidian、也不碰你的真实笔记**：
-
-```bash
-node tests/run.js
-```
-
-```
-tests/obsidian-stub.js   极简 obsidian API 存根（Plugin/ItemView/Modal/Notice/Setting/TFile…）
-tests/fixture-vault.js   在临时目录里搭一个迷你库（会议/项目/计划/assets/AGENTS.md）
-tests/run.js             断言：纯函数 + 合成库扫描
-```
-
-设计上刻意把逻辑都写成**不依赖 Obsidian 的纯函数**（`parseTaskLine`、`deriveStatus`、`applyStatusChange`、`isSourcePathForScope`…），`module.exports` 一并导出，所以可以直接在 Node 里断言。加了新逻辑，最好在 `tests/run.js` 补一条。
-
-## 更新日志
-
-### 1.0.2
-
-- **新功能：已逾期透视——过期的待办一查就到。** 逾期任务往往来自**过去的会议**（比如 9 月的会排出 `📅 9-20`，10 月还没做完），而回顾页默认按会议日期圈范围，过去会议的任务不在当前看板里，此前根本查不到。现在有三个入口：
-  - 回顾页新增第六张「**已逾期**」红色统计卡（跨范围计数，不随上方范围变化）；
-  - 总览页底部积压提醒行新增「**查看逾期清单**」按钮；总览页指标卡也加了「已逾期」，点击直达；
-  - 开启后看板变成单独一栏「已逾期的任务」，**按截止日期升序**（过期最久的排最前），会议清单跨范围列出含逾期任务的会议；
-  - 判定口径：未完成（未开始/进行中）且 `📅` 早于今天；已完成、已取消的不算——已经交代过了。可与「只看我的」「会议锁定」叠加。
-- 新增纯函数 `isOverdueTask(task, todayStr)` / `filterOverdue(snapshot, onlyMine, now)`（已导出，`node tests/run.js` 可断言）；透视不进扫描缓存键，切换瞬时完成。
-
-### 1.0.1
-
-- **修复：点会议行的状态小标签时，只筛这一场会议。** 之前点「进行中 7」会把**全库**所有进行中的任务都拉出来，而不是这一场的 7 项。现在点小标签会同时锁定「这一场会议」+「这个状态」：
-  - 新增纯函数 `filterByMeeting(snapshot, meetingPath, onlyMine, now)`，按会议路径收窄任务集，并把两张「本月」卡改成本场口径，避免卡片数字与看板打架；
-  - 锁定的会议行高亮，工具条出现 `会议：xxx ×` 标签，清单标题变「已锁定 1 场会议」；再点小标签、点 chip 的 `×`、或点「显示全部会议」都能还原；
-  - 单栏看板标题写成「会议名 · 进行中」，避免忘记在看哪一场；可与「只看我的」叠加。
-- 新增 `versions.json`（供社区插件市场使用）。
-
-### 1.0.0
-
-首个发布版本。统计会议次数、汇总会议行动项（未开始/进行中/已完成）、管理未来工作安排，并在勾选任务完成时自动写入完成时间、弹窗记录完成情况。
-
-## 已知限制
-
-- 逾期任务**没有单独处理**：超过 `📅` 的未完成任务仍显示在「进行中」，只在总览页给一行积压提醒。
-- 「未开始」依赖 `🛫`：不写开始日期就无法进入「未开始」栏（这是刻意的规则，避免满屏都是「未开始」）。
-- Calendar 联动是**事件驱动**的近似方案：它监听文件创建事件后改名，不是 Calendar 内部钩子，因此极小概率下会与你同时重命名同名文件冲突。
-- 只处理 Obsidian 的 Markdown 文件，不解析 Dataview / Tasks 的查询语法。
-
-## 许可
-
-[MIT](LICENSE)
+1. 命令面板执行 `插件: 重新加载`，或用 CLI：`obsidian plugin:reload id=workbench`
+2. 检查错误：`obsidian dev:errors`
+3. 发现异常时先看 `obsidian dev:console level=error`
