@@ -10,7 +10,7 @@
  *      并弹窗询问「完成情况」，内容写成任务下方的缩进子行；
  *   4) 在普通笔记视图里直接勾选任务（Tasks 插件或原生复选框），同样会触发询问。
  *
- * 任务格式（沿用仓库既有约定，兼容 Tasks 插件）：
+ * 任务格式（兼容 Tasks 插件的 emoji 格式）：
  *   - [ ] #action 任务内容 👤执行人 📅 2026-10-10 ➕ 2026-10-01
  *   - [/] #action 进行中的任务 🛫 2026-10-08
  *   - [x] #action 已完成的任务 ✅ 2026-10-12
@@ -67,26 +67,45 @@ const PRIORITY_RE = /🔺|⏫|🔼|🔽/;
 // 但撤销清理必须同时认识老笔记里写死的「完成情况」，见 completionNoteRe()
 const LEGACY_COMPLETION_LABEL = '完成情况';
 
+/**
+ * 工作安排目录的兜底默认。留空会让「回顾」页扫不到任何文件，
+ * 所以这里给一个中性名字；首次启动的引导页会引导用户改成自己的目录。
+ */
+const DEFAULT_PLAN_FOLDER = '计划';
+
+/**
+ * 取目录列表里第一个有效项。注意 `[]` 是 truthy，
+ * 所以不能写 `list || [兜底]`——空列表时会拿到 undefined。
+ */
+function firstFolder(list, fallback) {
+	const hit = (list || []).find((f) => f && String(f).trim());
+	return hit ? String(hit).trim() : fallback || '';
+}
+
 const DEFAULT_SETTINGS = {
-	meetingFolders: ['02-Business/1.会议', '01-Company/3.运营/润道智算科技/会议纪要'],
+	// 会议目录：这些目录里的 .md 一律算会议。首次安装为空，请到设置里填成你自己的目录。
+	meetingFolders: [],
 	// 附加目录：里面的 #action 也进看板；其中只有带 `会议类别` 的才算会议、计入会议数
-	extraFolders: ['02-Business/2.商机', '02-Business/3.项目'],
+	extraFolders: [],
 	// 未来工作安排目录：`YYYY-MM-DD-事件.md`，一个安排一个笔记
-	planFolders: ['04-Operations'],
-	// Calendar 点出来的文件：日期 < 今天 落会议目录，日期 >= 今天 落工作安排目录
+	planFolders: [DEFAULT_PLAN_FOLDER],
+	// Calendar 点出来的文件：日期 < 今天 落会议目录，日期 >= 今天 落工作安排目录。
+	// 开始日期落位目录留空时该分支自动跳过，不会误建到别处。
 	calendarDailyRouting: true,
-	calendarMeetingFolder: '02-Business/1.会议',
-	calendarMeetingTemplate: '99-System/Templates/纪要模版.md',
+	calendarMeetingFolder: '',
+	calendarMeetingTemplate: '',
 	taskTag: '#action',
-	// 「只看我的」判定用：设置里可改成自己的姓名/别名（多个用顿号或换行分隔）
-	selfNames: ['赖凯'],
+	// 「只看我的」判定用：填自己的姓名/别名（多个用顿号或换行分隔），留空则按钮禁用
+	selfNames: [],
 	defaultScope: 'month',
 	writeStartDate: true,
 	promptInView: true,
 	promptInEditor: true,
 	completionLabel: '完成情况',
 	promptPresets: ['已按时完成', '部分完成', '延期完成', '受阻待跟进'],
-	excludeFolders: ['99-System/Templates', '07-Archive'],
+	excludeFolders: [],
+	// 首次安装引导是否已处理（用户点了「跳过」或配好了目录就置 true）
+	onboardingDismissed: false,
 };
 
 /* ------------------------------------------------------------------ */
@@ -482,8 +501,8 @@ function isOverdueTask(task, todayStr) {
  * 会议行里点了状态小标签后的收窄（纯函数，便于单测）。
  *
  * 为什么需要它：会议行右侧的「进行中 7」如果只设 statusFilter，
- * 看板会把**全库**所有进行中的任务都拉出来（可能几百项），
- * 而不是这一场会议的 7 项。所以点小标签时必须同时锁定会议。
+ * 看板会把**全库**所有进行中的任务都拉出来，而不是这一场的 7 项。
+ * 所以点小标签时必须同时锁定会议。
  *
  * @param {object} snapshot 扫描快照
  * @param {string|null} meetingPath 锁定的会议文件路径
@@ -567,7 +586,7 @@ function parseDailyFileName(fileName) {
 
 /**
  * Calendar 文件名的基础部分（不含 `.md`）。
- * 新生成的一律是 `YYYY-MM-DD-工作安排`，与仓库里计划文件的命名、二级分类一致。
+ * 新生成的一律是 `YYYY-MM-DD-工作安排`，与工作安排目录里计划文件的命名、二级分类一致。
  */
 function dailyFileBase(dateStr) {
 	return `${dateStr}-工作安排`;
@@ -625,10 +644,10 @@ function dailyNoteTargetPath(opts, exists) {
 }
 
 /**
- * 把 `99-System/Templates/纪要模版.md` 渲染成一条可用的会议笔记。
+ * 把用户配置的会议纪要模版渲染成一条可用的会议笔记。
  * 模版里的 Templater 语法（`<% tp.date.now(...) %>`）脱离 Templater 上下文时要自己替换，
  * 否则生成的笔记里会残留语法字符串。同时在 `# 1.  基本信息` 前补一行 `# 日期 标题`
- * ——仓库里的会议纪要都有这行 H1，模版本身没有。
+ * ——插件生成的纪要统一带这行 H1，模版本身通常没有。
  */
 function renderMeetingTemplate(template, input) {
 	const date = String(input.date || '');
@@ -640,16 +659,27 @@ function renderMeetingTemplate(template, input) {
 	let text = String(template || '')
 		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DDTHH:mm:ss\+08:00"\)\s*%>/g, stamp)
 		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DD"\)\s*%>/g, date);
-	// 模版的 modified 是写死的常量（不是 Templater 语法），必须替换成本次生成时间
+	// 模版的 modified / date 可能是写死的常量（不是 Templater 语法），必须替换成本次生成的值，
+	// 否则生成的会议笔记会带着模版作者当时的日期。
 	text = text.replace(/^modified:.*$/m, `modified: ${stamp}`);
+	if (date) text = text.replace(/^date:.*$/m, `date: ${date}`);
 	// 模版里的「会议主题/时间/地点」三行是空的，按已知信息补上。
 	// replacement 一律写成函数：用户输入里的 `$&`/`$$`/`$1` 否则会被当成替换模式展开。
 	text = text.replace(/^(- \*\*会议主题\*\*)[ \t]*：.*$/m, (m0, head) => `${head}：${title}`);
 	if (time) text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, (m0, head) => `${head} ${date} ${time}`);
 	else text = text.replace(/^(- \*\*会议时间\*\*:).*$/m, (m0, head) => `${head} ${date}`);
 	if (place) text = text.replace(/^(- \*\*会议地点\*\*：).*$/m, (m0, head) => `${head}${place}`);
-	// 模版的待办占位没有 #action，照抄出来不会进工作台看板；补上标签以保持联动
-	text = text.replace(/^- \[ \] 任务内容 👤执行人 📅 (\d{4}-\d{2}-\d{2})[ \t]*$/m, `- [ ] #action 任务内容 👤执行人 📅 $1`);
+	// 模版里「像待办」的行（含 👤 或 📅）若没写任务标签，照抄出来不会进工作台看板；补上以保持联动。
+	// 只补这类行，避免把模版里普通的示例复选框也变成统计对象。replacement 用函数形式——taskTag 来自用户设置。
+	const taskTag = String(input.taskTag || '#action');
+	text = text
+		.split('\n')
+		.map((l) => {
+			if (l.includes(taskTag)) return l;
+			if (!/[👤📅]/.test(l)) return l;
+			return l.replace(/^([ \t>]*-[ \t]+\[[ \t]\][ \t]+)/, (m0, head) => `${head}${taskTag} `);
+		})
+		.join('\n');
 	const lines = text.split('\n');
 	// 模版 frontmatter 收尾后多了一行孤立的 `---`（模版自身的历史笔误），
 	// 真实会议纪要里没有；渲染时去掉，避免出来一个空分隔块。
@@ -668,7 +698,7 @@ function renderMeetingTemplate(template, input) {
 	return lines.join('\n');
 }
 
-/** 兜底：仓库里找不到纪要模版时，用这份内置结构生成会议笔记 */
+/** 兜底：没配置模版、或模版读不到时，用这份内置结构生成会议笔记 */
 function buildMeetingDayNote(input) {
 	const now = input.now || new Date();
 	const date = input.date;
@@ -1073,8 +1103,26 @@ function isUnder(path, folder) {
 }
 
 /**
+ * 实际生效的排除清单 = 用户显式配置的 `excludeFolders` + 由其它设置推导出的项。
+ *
+ * 推导是**只读、不落盘**的：这样用户改了「会议纪要模版」的位置后，旧位置的排除
+ * 会立刻失效，不会残留成僵尸配置（如果把推导结果写回设置，就会出现「改过的地方
+ * 永远被排除」的怪现象）。
+ *
+ * 这里只排除模版**文件本身**，不排除它所在的目录——模版可能就放在会议目录里，
+ * 排除整个目录会把真会议一起干掉。
+ */
+function resolveExcludeFolders(settings) {
+	const s = settings || {};
+	const out = (s.excludeFolders || []).filter(Boolean).slice();
+	const tpl = String(s.calendarMeetingTemplate || '').trim().replace(/^\/+/, '');
+	if (tpl && !out.includes(tpl)) out.push(tpl);
+	return out;
+}
+
+/**
  * 扫描来源的排除规则（三类目录共用，必须一致——曾因 planFolders 漏用此规则
- * 导致 04-Operations/AGENTS.md 被当成文档计数）：
+ * 导致计划目录下的 AGENTS.md 被当成文档计数）：
  * 排除目录、assets 附件目录、AGENTS/README/说明/索引 之类非正文文件。
  */
 function isExcludedSourcePath(path, excludeFolders) {
@@ -1094,7 +1142,7 @@ function isExcludedSourcePath(path, excludeFolders) {
  */
 function isSourcePathForScope(path, scope, settings) {
 	const s = settings || {};
-	if (isExcludedSourcePath(path, s.excludeFolders)) return false;
+	if (isExcludedSourcePath(path, resolveExcludeFolders(s))) return false;
 	if (scope === 'all') return true;
 	const inFolders = (list) => (list || []).some((f) => f && isUnder(path, f));
 	return (
@@ -1253,7 +1301,7 @@ class ArrangementModal extends Modal {
 			cls: 'wb-modal-hint',
 			text: editing
 				? '改日期/时间/地点/参与人，正文里的待办原样保留'
-				: `会写成 ${this.opts.folder || '04-Operations'}/YYYY-MM-DD-事件.md`,
+				: `会写成 ${this.opts.folder || DEFAULT_PLAN_FOLDER}/YYYY-MM-DD-事件.md`,
 		});
 
 		const form = contentEl.createDiv({ cls: 'wb-form' });
@@ -1280,7 +1328,7 @@ class ArrangementModal extends Modal {
 		l2.createEl('label', { cls: 'wb-form-label', text: '参与人' });
 		this.peopleInput = l2.createEl('input', { type: 'text', cls: 'wb-form-input' });
 		this.peopleInput.value = init.attendees || '';
-		this.peopleInput.placeholder = '例：赖凯、周华强';
+		this.peopleInput.placeholder = '例：张三、李四';
 
 		if (!editing) {
 			const noteRow = form.createDiv({ cls: 'wb-form-row' });
@@ -1420,6 +1468,12 @@ class WorkbenchView extends ItemView {
 		contentEl.empty();
 		contentEl.addClass('wb-root');
 
+		// 首次安装引导：还没配任何目录时先让用户选一种配置方式，避免开局一片空白
+		if (this.plugin.needsOnboarding()) {
+			this.renderOnboarding(contentEl);
+			return;
+		}
+
 		const snapshot = this.plugin.getSnapshot(this.state);
 		if (!snapshot) {
 			contentEl.createDiv({ cls: 'wb-loading', text: '正在扫描仓库……' });
@@ -1472,6 +1526,80 @@ class WorkbenchView extends ItemView {
 	}
 
 	/**
+	 * 首次安装引导。三种预设，点任意一个都会把 onboardingDismissed 置 true。
+	 * 推荐结构会在库根创建 会议/ 项目/ 计划/ 三个目录——这是用户显式点击的结果，
+	 * 不会在别处偷偷建目录。
+	 */
+	renderOnboarding(root) {
+		const wrap = root.createDiv({ cls: 'wb-onboard' });
+		wrap.createEl('h2', { text: '欢迎使用工作台' });
+		wrap.createEl('p', {
+			cls: 'wb-onboard-lead',
+			text: '工作台需要知道「会议记录放在哪」，才能统计本月会议次数、汇总行动项。先选一种方式开始：',
+		});
+
+		const presets = [
+			{
+				title: '创建推荐目录结构',
+				desc: '在库根新建 会议/、项目/、计划/ 三个目录并自动配好。适合从零开始，或先试一下。',
+				action: '创建并开始',
+			},
+			{
+				title: '使用我已有的目录',
+				desc: '我库里的会议纪要已有固定位置。跳过引导，直接到设置里填路径。',
+				action: '去设置',
+			},
+			{
+				title: '稍后再说',
+				desc: '暂时不配置。随时可以在 设置 → 工作台 里补上。',
+				action: '跳过',
+			},
+		];
+
+		presets.forEach((preset, i) => {
+			const card = wrap.createDiv({ cls: 'wb-onboard-card' });
+			const left = card.createDiv({ cls: 'wb-onboard-card-main' });
+			left.createDiv({ cls: 'wb-onboard-card-title', text: preset.title });
+			left.createDiv({ cls: 'wb-onboard-card-desc', text: preset.desc });
+			const btn = card.createEl('button', { cls: 'wb-btn', text: preset.action, attr: { type: 'button' } });
+			if (i === 0) btn.addClass('wb-btn-done');
+			btn.addEventListener('click', () => this.applyOnboardingPreset(i));
+		});
+
+		wrap.createDiv({
+			cls: 'wb-onboard-foot',
+			text: '任务格式：- [ ] #action 内容 👤执行人 📅 截止日期 ➕ 创建日期。工作台兼容 Tasks 插件的 emoji 格式。',
+		});
+	}
+
+	/** 应用引导预设。0=推荐结构 1=已有目录 2=跳过 */
+	async applyOnboardingPreset(index) {
+		const s = this.plugin.settings;
+		try {
+			if (index === 0) {
+				for (const folder of ['会议', '项目', '计划']) {
+					if (!this.app.vault.getAbstractFileByPath(folder)) {
+						await this.app.vault.createFolder(folder).catch(() => {});
+					}
+				}
+				s.meetingFolders = ['会议'];
+				s.extraFolders = ['项目'];
+				s.planFolders = ['计划'];
+				s.calendarMeetingFolder = '会议';
+			}
+			s.onboardingDismissed = true;
+			await this.plugin.saveSettings();
+			if (index === 1) {
+				this.plugin.activateSettings();
+				new Notice('请在工作台设置里填写会议目录');
+			}
+			this.render();
+		} catch (e) {
+			new Notice(`引导设置失败：${e.message}`);
+		}
+	}
+
+	/**
 	 * 「已逾期」透视（不进扫描缓存键）：把全量池里未完成且过截止期的任务
 	 * 拉进看板，不受当前「范围」限制——逾期的活儿往往挂在过去的会议里。
 	 */
@@ -1503,17 +1631,12 @@ class WorkbenchView extends ItemView {
 
 	/**
 	 * 会议行里点了状态小标签：把看板收窄到「这一场会议」。
-	 * 必须先按会议收窄再交给其它筛选，否则点「进行中 7」会把全库 575 项
-	 * 里所有进行中的任务都拉出来，而不是这一场的 7 项。
+	 * 必须先按会议收窄再交给其它筛选，否则点「进行中 7」会把库里的
+	 * 全部进行中任务都拉出来，而不是这一场的 7 项。
 	 * 会议筛选不进扫描缓存键：只重绘 DOM，不重扫仓库。
 	 */
 	applyMeeting(snapshot) {
-		return filterByMeeting(
-			snapshot,
-			this.state.meetingFilter,
-			this.state.onlyMine,
-			new Date(),
-		);
+		return filterByMeeting(snapshot, this.state.meetingFilter, this.state.onlyMine, new Date());
 	}
 
 	/** 页签：回顾（会议行动项） / 计划（未来工作安排） */
@@ -1548,7 +1671,7 @@ class WorkbenchView extends ItemView {
 	}
 
 	openArrangementForm(item) {
-		const folder = (this.plugin.settings.planFolders || ['04-Operations'])[0];
+		const folder = firstFolder(this.plugin.settings.planFolders, DEFAULT_PLAN_FOLDER);
 		if (item && item.file) {
 			new ArrangementModal(this.app, {
 				folder,
@@ -1609,7 +1732,7 @@ class WorkbenchView extends ItemView {
 		if (!future.length && !undated.length) {
 			body.createDiv({
 				cls: 'wb-empty',
-				text: '还没有未来安排。点右上角「＋ 新增安排」录入，会写成 04-Operations/YYYY-MM-DD-事件.md',
+				text: `还没有未来安排。点右上角「＋ 新增安排」录入，会写成 ${firstFolder(this.plugin.settings.planFolders, DEFAULT_PLAN_FOLDER)}/YYYY-MM-DD-事件.md`,
 			});
 		} else {
 			this.renderPlanRows(body, future, now, false);
@@ -2287,7 +2410,7 @@ class WorkbenchView extends ItemView {
 		const headText = sf
 			? `${baseLabel} · 含「${STATUS_LABEL[sf]}」任务（${shown.length} 次）`
 			: `${baseLabel}（${shown.length} 次）`;
-		head.createSpan({ text: mf ? `已锁定 1 场会议` : headText });
+		head.createSpan({ text: mf ? '已锁定 1 场会议' : headText });
 		if (mf) {
 			const un = head.createEl('button', { cls: 'wb-btn wb-btn-plain', text: '显示全部会议' });
 			un.addEventListener('click', () => this.applyFilter({ meetingFilter: null }));
@@ -2337,7 +2460,7 @@ class WorkbenchView extends ItemView {
 					e.preventDefault();
 					e.stopPropagation();
 					// 关键：同时锁定「这一场会议」和「这个状态」，
-					// 否则只会把全月该状态的任务都拉出来，而不是这一场的。
+					// 否则只会把库里该状态的任务都拉出来，而不是这一场的。
 					if (active) {
 						this.applyFilter({ meetingFilter: null, statusFilter: null });
 					} else {
@@ -2584,7 +2707,7 @@ class TaskEditModal extends Modal {
 		c2.createEl('label', { cls: 'wb-form-label', text: '执行人' });
 		this.whoInput = c2.createEl('input', { type: 'text', cls: 'wb-form-input' });
 		this.whoInput.value = (t.assignees || []).join('、');
-		this.whoInput.placeholder = '例：赖凯 或 [[赖凯]]';
+		this.whoInput.placeholder = '例：张三 或 [[张三]]';
 
 		const pRow = form.createDiv({ cls: 'wb-form-row' });
 		pRow.createEl('label', { cls: 'wb-form-label', text: '优先级' });
@@ -2732,7 +2855,7 @@ class WorkbenchPlugin extends Plugin {
 		);
 
 		// 外部新增/删除/改名同样要重算并重绘：只 invalidateCache 不刷新的话，
-		// 手动往 04-Operations 丢一个文件进去，看板要等下次交互才更新。
+		// 手动往工作安排目录丢一个文件进去，看板要等下次交互才更新。
 		const onStructureChange = debounce(() => this.refreshViews(), 250, true);
 		// create 订阅必须推迟到布局就绪：Obsidian 启动时会给存量文件**补发** create 事件，
 		// 直接订阅会让 Calendar 落位逻辑对历史文件发难（过去日期的笔记会被改写/搬走）。
@@ -2814,6 +2937,26 @@ class WorkbenchPlugin extends Plugin {
 		return true;
 	}
 
+	/**
+	 * 是否需要显示首次安装引导。
+	 * 判据只看「会议目录」是否为空——`planFolders` 有兜底默认值（`计划`），
+	 * 不能拿它当判据，否则引导永远不出现。用户点过「跳过」就不再打扰。
+	 */
+	needsOnboarding() {
+		const s = this.settings || {};
+		if (s.onboardingDismissed) return false;
+		return !(s.meetingFolders || []).some((f) => f && String(f).trim());
+	}
+
+	/** 打开工作台设置页（引导里「去设置」用） */
+	activateSettings() {
+		const setting = this.app.setting;
+		if (setting && typeof setting.open === 'function') {
+			setting.open();
+			if (typeof setting.openTabById === 'function') setting.openTabById(this.manifest.id);
+		}
+	}
+
 	/* ------------------- Calendar 自动落位 ------------------- */
 
 	/**
@@ -2827,8 +2970,8 @@ class WorkbenchPlugin extends Plugin {
 		if (!(file instanceof TFile) || file.extension !== 'md') return;
 		const date = parseDailyFileName(file.name);
 		if (!date) return;
-		const planFolders = this.settings.planFolders || ['04-Operations'];
-		const planRoot = String(planFolders[0] || '').replace(/\/+$/, '');
+		const planFolders = this.settings.planFolders || [];
+		const planRoot = firstFolder(planFolders, DEFAULT_PLAN_FOLDER).replace(/\/+$/, '');
 		if (!planRoot || !isUnder(file.path, planRoot)) return;
 		// 注意：renameFile 会**原地改写** TFile.path，所以 busy 键必须在改名**之前**
 		// 就取出来存好，且在 finally 里用这个原始键删除——曾因此在 finally 里
@@ -2928,7 +3071,7 @@ class WorkbenchPlugin extends Plugin {
 
 	/** 排除规则：排除目录、assets 附件目录、AGENTS/README 之类索引文件 */
 	isExcludedPath(path) {
-		return isExcludedSourcePath(path, this.settings.excludeFolders);
+		return isExcludedSourcePath(path, resolveExcludeFolders(this.settings));
 	}
 
 	/** 是否在「会议目录」下（这些目录里的文件默认都算会议） */
@@ -3438,9 +3581,9 @@ class WorkbenchPlugin extends Plugin {
 
 	/* --------------------------- 其他 --------------------------- */
 
-	/** 新建一条工作安排：04-Operations/YYYY-MM-DD-事件.md */
+	/** 新建一条工作安排：<工作安排目录>/YYYY-MM-DD-事件.md */
 	async createArrangement(input) {
-		const folder = (this.settings.planFolders || ['04-Operations'])[0].replace(/\/+$/, '');
+		const folder = firstFolder(this.settings.planFolders, DEFAULT_PLAN_FOLDER).replace(/\/+$/, '');
 		const date = input.date;
 		const base = `${date}-${sanitizeFileName(input.title)}`;
 		let path = `${folder}/${base}.md`;
@@ -3654,7 +3797,7 @@ class WorkbenchSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('会议目录')
-			.setDesc('每行一个仓库相对路径，工作台只统计这些目录下的会议与行动项。')
+			.setDesc('每行一个仓库相对路径；这些目录里的 .md 一律算会议。首次安装为空，请填成你自己的会议目录。')
 			.addTextArea((t) => {
 				t.inputEl.rows = 4;
 				t.setValue((this.plugin.settings.meetingFolders || []).join('\n'));
@@ -3716,7 +3859,7 @@ class WorkbenchSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Calendar 过去日期落位目录')
-			.setDesc('日期早于今天时，把它改名成 `YYYY-MM-DD-会议.md` 放这里。默认 `02-Business/1.会议`。')
+			.setDesc('日期早于今天时，把它改名成 `YYYY-MM-DD-会议.md` 放这里。留空则该分支不生效。')
 			.addText((t) =>
 				t.setValue(this.plugin.settings.calendarMeetingFolder || '').onChange(async (v) => {
 					this.plugin.settings.calendarMeetingFolder = v.trim();
@@ -3863,6 +4006,8 @@ module.exports.buildDailyNote = buildDailyNote;
 module.exports.buildMeetingDayNote = buildMeetingDayNote;
 module.exports.isPlanFile = isPlanFile;
 module.exports.isExcludedSourcePath = isExcludedSourcePath;
+module.exports.resolveExcludeFolders = resolveExcludeFolders;
+module.exports.firstFolder = firstFolder;
 module.exports.isSourcePathForScope = isSourcePathForScope;
 module.exports.parseArrangement = parseArrangement;
 module.exports.buildArrangementNote = buildArrangementNote;
@@ -3890,7 +4035,7 @@ module.exports.countByStatus = countByStatus;
 module.exports.isOverdueTask = isOverdueTask;
 module.exports.filterByMeeting = filterByMeeting;
 module.exports.filterOverdue = filterOverdue;
-module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.STATUS = STATUS;
+module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;
 module.exports.compareMeetingsByDateDesc = compareMeetingsByDateDesc;
