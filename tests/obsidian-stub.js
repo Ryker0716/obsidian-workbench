@@ -5,7 +5,13 @@
 class Plugin {}
 class ItemView {}
 class Modal {}
-class Notice {}
+class Notice {
+	constructor(message) {
+		this.message = message;
+		// 测试用：记下最后一条提示，主类逻辑（如 setTaskStatus）的文案可以被断言
+		Notice.last = message;
+	}
+}
 class Setting {}
 class PluginSettingTab {}
 class TFile {}

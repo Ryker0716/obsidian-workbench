@@ -2654,14 +2654,19 @@ class WorkbenchView extends ItemView {
 			});
 		};
 
+		const cancelTip =
+			'取消此任务：标记 [-]，从看板消失；📅 截止保留，清除 🛫/✅ 与完成情况子行';
 		if (task.status === STATUS.TODO) {
 			mk('开始', STATUS.DOING);
 			mk('完成', STATUS.DONE, 'wb-btn-done');
+			mk('取消任务', STATUS.CANCELLED, '', cancelTip);
 		} else if (task.status === STATUS.DOING) {
 			mk('完成', STATUS.DONE, 'wb-btn-done');
 			mk('转为未开始', STATUS.TODO, '', '从明天起算未开始（会写入 🛫 明天）');
+			mk('取消任务', STATUS.CANCELLED, '', cancelTip);
 		} else if (task.status === STATUS.DONE) {
 			mk('撤销完成', STATUS.DOING);
+			mk('取消任务', STATUS.CANCELLED, '', cancelTip);
 		}
 	}
 }
@@ -3567,7 +3572,9 @@ class WorkbenchPlugin extends Plugin {
 						? '任务已开始'
 						: nextStatus === STATUS.TODO
 							? '任务已转为未开始（开始日期设为明天）'
-							: '任务状态已更新',
+							: nextStatus === STATUS.CANCELLED
+								? '任务已取消'
+								: '任务状态已更新',
 				);
 			}
 		} catch (e) {

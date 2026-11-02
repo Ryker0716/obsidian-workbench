@@ -66,6 +66,19 @@ ok('撤销完成回到 [/]', back.includes('- [/]'), back);
 const unchanged = W.applyStatusChange(line, W.STATUS.DOING, {});
 ok('改状态不动描述与日期', unchanged.includes('某任务') && unchanged.includes('📅 2026-10-01'), unchanged);
 
+// 取消（[-]）：符号改写、📅 保留、🛫/✅ 清除
+const cancLine = '- [ ] #action 某任务 👤[[张三]] 📅 2026-10-01 🛫 2026-09-20';
+const cancelled = W.applyStatusChange(cancLine, W.STATUS.CANCELLED, {});
+ok('取消写 [-]', cancelled.includes('- [-]'), cancelled);
+ok('取消摘掉 🛫', !cancelled.includes('🛫'), cancelled);
+ok('取消保留 📅', cancelled.includes('📅 2026-10-01'), cancelled);
+ok('取消不写 ✅', !cancelled.includes('✅'), cancelled);
+const doneToCancelled = W.applyStatusChange(done, W.STATUS.CANCELLED, { doneDate: '2026-10-06' });
+ok('已完成→取消：摘掉 ✅', !doneToCancelled.includes('✅'), doneToCancelled);
+ok('已完成→取消：写成 [-] 且无 🛫/✅ 残留',
+	doneToCancelled.includes('- [-]') && !/🛫|✅/.test(doneToCancelled), doneToCancelled);
+ok('statusFromSymbol("-") = cancelled', W.statusFromSymbol('-') === 'cancelled', W.statusFromSymbol('-'));
+
 /* ================= 3. 完成情况子行 ================= */
 console.log('\n=== 3. 完成情况子行 ===');
 const built = W.buildCompletionNote('\t', '2026-10-05 10:30', '已交付', '完成情况');
@@ -540,13 +553,65 @@ ok('会议筛选不进扫描缓存键',
 	W.viewCacheKey({ scope: 'month' }) ===
 		W.viewCacheKey({ scope: 'month', meetingFilter: '会议/a.md', statusFilter: 'doing' }));
 
-/* ================= 汇总 ================= */
-console.log(`\n${'='.repeat(48)}`);
-if (fail) {
-	console.log(`结果：${pass} 通过 / ${fail} 失败`);
-	console.log('\n失败项：');
-	for (const f of failures) console.log('  - ' + f);
-} else {
-	console.log(`结果：${pass} 通过 / 0 失败`);
-}
-process.exit(fail ? 1 : 0);
+/* ================= 28. 取消任务（主类 setTaskStatus → CANCELLED） ================= */
+console.log('\n=== 28. 取消任务：setTaskStatus 落盘与提示 ===');
+(async () => {
+	const stub = require(stubPath);
+	const p = Object.create(W.prototype);
+	p.settings = Object.assign({}, W.DEFAULT_SETTINGS, { promptInView: true });
+	p.internalWrites = 0;
+	p.snapshots = new Map();
+	p.cache = null;
+	p.cacheKey = null;
+	p.invalidateCache = () => {};
+	p.refreshViews = () => {};
+	p.snapshotFile = async () => {};
+	let asked = 0;
+	p.askCompletion = async () => {
+		asked += 1;
+		return '不该被调用';
+	};
+
+	const raw = '- [/] #action 某任务 👤[[张三]] 📅 2026-10-01 🛫 2026-09-20';
+	const state = {
+		content: `${raw}\n\t- ✅ 2026-09-21 10:00 完成情况：旧结论\n`,
+	};
+	p.app = {
+		vault: {
+			read: async () => state.content,
+			process: async (f, fn) => {
+				const next = fn(state.content);
+				state.content = next;
+				return next;
+			},
+			modify: async (f, c) => {
+				state.content = c;
+			},
+		},
+	};
+
+	stub.Notice.last = null;
+	await p.setTaskStatus(
+		{ file: { path: '会议/2026-09-10-示例会议 A.md', basename: '2026-09-10-示例会议 A' }, lineNumber: 0, rawLine: raw, indent: '', description: '某任务' },
+		W.STATUS.CANCELLED,
+	);
+
+	ok('取消后提示「任务已取消」', stub.Notice.last === '任务已取消', String(stub.Notice.last));
+	ok('取消不弹完成情况弹窗', asked === 0, String(asked));
+	ok('任务行已标记 [-]', state.content.includes('- [-]'), state.content);
+	ok('取消保留 📅', state.content.includes('📅 2026-10-01'), state.content);
+	ok('取消清除 🛫 与 ✅', !/🛫|✅/.test(state.content), state.content);
+	ok('完成情况子行被清除', !state.content.includes('完成情况'), state.content);
+	ok('取消后计数器归零', p.internalWrites === 0, String(p.internalWrites));
+
+	/* ================= 汇总 ================= */
+	console.log(`\n${'='.repeat(48)}`);
+	if (fail) {
+		console.log(`结果：${pass} 通过 / ${fail} 失败`);
+		console.log('\n失败项：');
+		for (const f of failures) console.log('  - ' + f);
+	} else {
+		console.log(`结果：${pass} 通过 / 0 失败`);
+	}
+	process.exit(fail ? 1 : 0);
+})();

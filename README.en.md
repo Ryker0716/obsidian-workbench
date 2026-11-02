@@ -219,6 +219,11 @@ By design, the logic is written as **pure functions that don't depend on Obsidia
 
 ## Changelog
 
+### 1.1.1
+
+- **New: a "Cancel task" button on every task card.** One click marks a task `[-]` (cancelled), so it immediately drops out of the board columns, the overdue lens and the upcoming list — while keeping its **📅 due date** (so you can still tell when it was supposed to be delivered). It clears the `🛫` start date, the `✅` done date and any completion-note child lines, and never opens the completion prompt.
+- Tests: `node tests/run.js` — 228 assertions passing (14 new: symbol/marker rewriting for cancellation, cleanup when cancelling a done task, `statusFromSymbol('-')`, and main-class `setTaskStatus` cancel-path assertions on the notice and the written line).
+
 ### 1.1.0
 
 - **Quality pass: three full-scope logic audits, 47 defects fixed (2 critical + 9 medium + 36 minor/hygiene).**
