@@ -673,6 +673,59 @@ console.log('\n=== 28. 取消任务：setTaskStatus 落盘与提示 ===');
 	ok('取消时不写盘', st2.content === `${rawDone}\n`, JSON.stringify(st2.content));
 	ok('取消时提示「任务未完成」', stub.Notice.last === '已取消，任务未完成', String(stub.Notice.last));
 
+	/* ================= 30. 会议清单排序（sortMeetings） ================= */
+	console.log('\n=== 30. 会议清单排序 ===');
+	{
+		const countsOf = (m) => m.counts || { todo: 0, doing: 0, done: 0 };
+		const mkM = (date, c) => ({
+			path: `会议/${date || '无日期'}.md`,
+			date,
+			counts: Object.assign({ todo: 0, doing: 0, done: 0 }, c || {}),
+		});
+		const meetings = [
+			mkM('2026-09-10', { doing: 1 }),
+			mkM(null, { doing: 5 }),
+			mkM('2026-10-20', { doing: 3 }),
+			mkM('2026-10-05', { doing: 3 }),
+		];
+
+		const desc = W.sortMeetings(meetings, countsOf, { key: 'date', dir: 'desc' });
+		ok('date desc：新→旧、无日期沉底',
+			desc.map((m) => m.date).join(',') === '2026-10-20,2026-10-05,2026-09-10,',
+			desc.map((m) => m.date).join(','));
+		const asc = W.sortMeetings(meetings, countsOf, { key: 'date', dir: 'asc' });
+		ok('date asc：旧→新、无日期仍沉底',
+			asc.map((m) => m.date).join(',') === '2026-09-10,2026-10-05,2026-10-20,',
+			asc.map((m) => m.date).join(','));
+		ok('asc 与 desc 互为倒序（有日期部分）',
+			desc.filter((m) => m.date).map((m) => m.date).join(',') ===
+				asc.filter((m) => m.date).map((m) => m.date).reverse().join(','));
+
+		const doingDesc = W.sortMeetings(meetings, countsOf, { key: 'doing', dir: 'desc' });
+		ok('doing desc：计数多→少，但无日期仍沉底（即使它计数最高）',
+			doingDesc.map((m) => m.counts.doing).join(',') === '3,3,1,5',
+			doingDesc.map((m) => m.counts.doing).join(','));
+		ok('计数相等时按日期降序 tie-break',
+			doingDesc[0].date === '2026-10-20' && doingDesc[1].date === '2026-10-05',
+			doingDesc.map((m) => m.date).join(','));
+		ok('doing asc：计数少→多',
+			W.sortMeetings(meetings, countsOf, { key: 'doing', dir: 'asc' }).map((m) => m.counts.doing).join(',') === '1,3,3,5',
+			W.sortMeetings(meetings, countsOf, { key: 'doing', dir: 'asc' }).map((m) => m.counts.doing).join(','));
+
+		const todoDesc = W.sortMeetings(meetings, countsOf, { key: 'todo', dir: 'desc' });
+		ok('todo desc：全 0 时按日期降序兜底',
+			todoDesc.map((m) => m.date).join(',') === '2026-10-20,2026-10-05,2026-09-10,',
+			todoDesc.map((m) => m.date).join(','));
+
+		const before = meetings.map((m) => m.date).join(',');
+		W.sortMeetings(meetings, countsOf, { key: 'done', dir: 'desc' });
+		ok('不改动入参数组', meetings.map((m) => m.date).join(',') === before && meetings.length === 4);
+		ok('缺省 sort 走日期降序',
+			W.sortMeetings(meetings, countsOf).map((m) => m.date).join(',') === '2026-10-20,2026-10-05,2026-09-10,',
+			W.sortMeetings(meetings, countsOf).map((m) => m.date).join(','));
+		ok('导出接口包含 sortMeetings', typeof W.sortMeetings === 'function');
+	}
+
 	/* ================= 汇总 ================= */
 	console.log(`\n${'='.repeat(48)}`);
 	if (fail) {

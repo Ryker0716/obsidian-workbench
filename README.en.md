@@ -219,6 +219,11 @@ By design, the logic is written as **pure functions that don't depend on Obsidia
 
 ## Changelog
 
+### 1.1.3
+
+- **The meeting list now has a header row, and all four columns are sortable.** A new header above the list reads "会议 ｜ 未开始 ｜ 进行中 ｜ 已完成": click "会议" to sort by date, click any of the three count cells to sort by that status's task count. The active column shows a direction arrow (↑ ascending / ↓ descending) and is highlighted; clicking the same column flips the direction (dates default newest→oldest, counts default most→fewest). The sort state lives in the view state, so it survives re-renders and refreshes; **meetings without a date always sink to the bottom in either direction**, and equal counts fall back to date-descending. No header is rendered for an empty list, and the header folds with the rows in narrow sidebars.
+- Tests: `node tests/run.js` — 249 assertions passing (10 new: `sortMeetings` date asc/desc, undated sinking, count sorting with equal-count tie-break, input not mutated, default argument, export check).
+
 ### 1.1.2
 
 - **The completion dialog now lets you pick the completion time (defaults to now).** The "Confirm completion" dialog's static time text became a `datetime-local` input, pre-filled with the moment the dialog opened; you can change it to any time (past or future — handy when logging yesterday's work). The chosen time is written both to the task line's `✅` done date and to the completion-note timestamp (date only on the line, minute precision in the note); the `🛫` written by the start/not-started branches still uses the system clock. An empty or invalid input falls back to the opening time, and cancelling still writes nothing.

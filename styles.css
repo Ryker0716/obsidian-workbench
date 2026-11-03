@@ -543,6 +543,32 @@
 	box-shadow: inset 3px 0 0 var(--interactive-accent);
 }
 
+/* 会议清单表头：结构对齐 wb-meeting-row（左标题 / 右三个计数格） */
+.wb-meeting-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 4px 12px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.wb-meeting-head .wb-sortable {
+	cursor: pointer;
+	user-select: none;
+}
+
+.wb-meeting-head .wb-sortable:hover {
+	color: var(--text-normal);
+}
+
+.wb-meeting-head .wb-sortable.is-sorted {
+	color: var(--text-accent);
+	font-weight: 600;
+}
+
 .wb-link,
 .wb-src {
 	color: var(--link-color);
@@ -561,6 +587,13 @@
 	font-size: 11px;
 	color: var(--text-muted);
 	white-space: nowrap;
+}
+
+/* 表头与行同为三格计数（未开始/进行中/已完成）：统一最小宽度 + 右对齐，数字列才对齐。
+   作用域限定在 .wb-meeting-counts 内，看板等其他面板不受影响。 */
+.wb-meeting-counts > span {
+	min-width: 58px;
+	text-align: right;
 }
 
 .wb-dot-todo {
@@ -599,6 +632,13 @@
 	}
 
 	.wb-meeting-row {
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 2px;
+	}
+
+	/* 窄容器下行会折列，表头跟着折，否则表头横排、行竖排看着错位 */
+	.wb-meeting-head {
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 2px;

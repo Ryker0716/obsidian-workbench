@@ -868,6 +868,40 @@ function compareMeetingsByDateDesc(a, b) {
 	return bd.localeCompare(ad);
 }
 
+/**
+ * 会议清单排序（纯函数，不改入参）。
+ * @param {Array} items 会议数组
+ * @param {(m:any)=>object} countsOf 取某场会议在当前透视下的 `{todo,doing,done}`
+ * @param {{key:'date'|'todo'|'doing'|'done', dir:'asc'|'desc'}} sort 排序键与方向
+ * 规则：
+ *   - 无日期（null/undefined/''）**无论方向一律沉底**；
+ *   - key='date'：desc 新→旧、asc 旧→新；
+ *   - key=todo/doing/done：按 countsOf(m)[key] 数值比，desc 多→少；
+ *   - 计数相等时用日期降序兜底（compareMeetingsByDateDesc 同款语义）。
+ */
+function sortMeetings(items, countsOf, sort) {
+	const s = sort && sort.key ? sort : { key: 'date', dir: 'desc' };
+	const getCounts = typeof countsOf === 'function' ? countsOf : (m) => (m && m.counts) || {};
+	const dateOf = (m) => (m && m.date ? String(m.date) : '');
+	return (items || []).slice().sort((a, b) => {
+		const ad = dateOf(a);
+		const bd = dateOf(b);
+		// 先把无日期的沉底：这一条优先于排序方向，否则翻转方向会把它们顶到最前
+		if (!ad && !bd) return 0;
+		if (!ad) return 1;
+		if (!bd) return -1;
+		if (s.key === 'date') {
+			if (ad === bd) return 0;
+			const cmp = ad < bd ? -1 : 1;
+			return s.dir === 'asc' ? cmp : -cmp;
+		}
+		const ca = Number((getCounts(a) || {})[s.key] || 0);
+		const cb = Number((getCounts(b) || {})[s.key] || 0);
+		if (ca !== cb) return s.dir === 'asc' ? ca - cb : cb - ca;
+		return compareMeetingsByDateDesc(a, b);
+	});
+}
+
 /** 相对今天的时间分组键 */
 function timeBucket(dateStr, now) {
 	const today = formatDate(now || new Date());
@@ -1456,6 +1490,8 @@ class WorkbenchView extends ItemView {
 			// 折叠态存进 state，重渲染（搜索防抖、刷新）后不再被重置
 			meetingsCollapsed: false,
 			pastCollapsed: true,
+			// 会议清单排序：点表头切换键与方向（date 默认新→旧，与历史行为一致）
+			meetingSort: { key: 'date', dir: 'desc' },
 		};
 	}
 
@@ -2426,7 +2462,6 @@ class WorkbenchView extends ItemView {
 			return; // 其他范围不展示会议清单
 		}
 
-		shown = shown.slice().sort(compareMeetingsByDateDesc);
 		if (sf) {
 			// 选了状态筛选时，会议清单只保留该状态下有任务的会议
 			shown = shown.filter((m) => countsOf(m)[sf] > 0);
@@ -2434,6 +2469,8 @@ class WorkbenchView extends ItemView {
 		// 点了某场会议的状态标签：清单只留这一场，方便对照
 		const mf = this.state.meetingFilter;
 		if (mf) shown = shown.filter((m) => m.path === mf);
+		// 排序放过滤之后：表头箭头指示的顺序就是列表顺序；纯函数不改入参
+		shown = sortMeetings(shown, countsOf, this.state.meetingSort);
 
 		const box = root.createDiv({ cls: 'wb-panel wb-meetings' });
 		const head = box.createDiv({ cls: 'wb-panel-head' });
@@ -2462,6 +2499,37 @@ class WorkbenchView extends ItemView {
 			list.createDiv({ cls: 'wb-empty', text: '该范围内暂无可显示的会议' });
 			return;
 		}
+
+		// 表头：点「会议」按日期排，点三个计数格按对应状态数量排；再点同一列翻转方向。
+		// 只改 state 再整树重绘（走 this.render，不 invalidateCache——排序不该触发重扫）。
+		const sort = this.state.meetingSort || { key: 'date', dir: 'desc' };
+		const headRow = list.createDiv({ cls: 'wb-meeting-head' });
+		const sortCell = (parent, key, label) => {
+			const active = sort.key === key;
+			const arrow = active ? (sort.dir === 'asc' ? '↑' : '↓') : '';
+			const cell = parent.createSpan({
+				cls: `wb-sortable${active ? ' is-sorted' : ''}`,
+				text: `${label}${arrow ? ' ' + arrow : ''}`,
+				attr: {
+					title: active
+						? `当前按「${label}」${sort.dir === 'asc' ? '升序' : '降序'}，点击切换为${sort.dir === 'asc' ? '降序' : '升序'}`
+						: `按「${label}」${key === 'date' ? '降序（新→旧）' : '降序（多→少）'}排序`,
+				},
+			});
+			cell.addEventListener('click', () => {
+				// 换列：用该列默认方向（日期新→旧、计数多→少）；同列：翻转
+				const dir = active ? (sort.dir === 'asc' ? 'desc' : 'asc') : 'desc';
+				this.state.meetingSort = { key, dir };
+				this.render();
+			});
+		};
+		sortCell(headRow, 'date', '会议');
+		const headCounts = headRow.createDiv({ cls: 'wb-meeting-counts' });
+		[
+			['todo', STATUS_LABEL.todo],
+			['doing', STATUS_LABEL.doing],
+			['done', STATUS_LABEL.done],
+		].forEach(([key, label]) => sortCell(headCounts, key, label));
 
 		shown.forEach((m) => {
 			const locked = mf === m.path;
@@ -4087,3 +4155,4 @@ module.exports.STATUS = STATUS;
 module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;
 module.exports.compareMeetingsByDateDesc = compareMeetingsByDateDesc;
+module.exports.sortMeetings = sortMeetings;
