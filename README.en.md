@@ -219,6 +219,11 @@ By design, the logic is written as **pure functions that don't depend on Obsidia
 
 ## Changelog
 
+### 1.1.2
+
+- **The completion dialog now lets you pick the completion time (defaults to now).** The "Confirm completion" dialog's static time text became a `datetime-local` input, pre-filled with the moment the dialog opened; you can change it to any time (past or future — handy when logging yesterday's work). The chosen time is written both to the task line's `✅` done date and to the completion-note timestamp (date only on the line, minute precision in the note); the `🛫` written by the start/not-started branches still uses the system clock. An empty or invalid input falls back to the opening time, and cancelling still writes nothing.
+- Tests: `node tests/run.js` — 239 assertions passing (11 new: input value format and round-trip, the main-class completion path writing `✅` and the note with the chosen time, and cancel writing nothing).
+
 ### 1.1.1
 
 - **New: a "Cancel task" button on every task card.** One click marks a task `[-]` (cancelled), so it immediately drops out of the board columns, the overdue lens and the upcoming list — while keeping its **📅 due date** (so you can still tell when it was supposed to be delivered). It clears the `🛫` start date, the `✅` done date and any completion-note child lines, and never opens the completion prompt.

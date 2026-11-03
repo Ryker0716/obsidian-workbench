@@ -604,6 +604,75 @@ console.log('\n=== 28. 取消任务：setTaskStatus 落盘与提示 ===');
 	ok('完成情况子行被清除', !state.content.includes('完成情况'), state.content);
 	ok('取消后计数器归零', p.internalWrites === 0, String(p.internalWrites));
 
+	/* ================= 29. 自定义完成时间 ================= */
+	console.log('\n=== 29. 完成弹窗自定义完成时间 ===');
+	ok('控制值格式 YYYY-MM-DDTHH:mm',
+		W.localDateTimeInputValue(new Date(2026, 9, 1, 9, 30)) === '2026-10-01T09:30',
+		W.localDateTimeInputValue(new Date(2026, 9, 1, 9, 30)));
+	ok('控制值补零到分',
+		W.localDateTimeInputValue(new Date(2026, 2, 4, 5, 6)) === '2026-03-04T05:06',
+		W.localDateTimeInputValue(new Date(2026, 2, 4, 5, 6)));
+	ok('控制值可被 new Date 还原（精确到分）',
+		W.formatDateTime(new Date(W.localDateTimeInputValue(new Date(2026, 9, 1, 9, 30)))) === '2026-10-01 09:30');
+
+	const mkPlugin = (content, ask) => {
+		const st = { content };
+		const q = Object.create(W.prototype);
+		q.settings = Object.assign({}, W.DEFAULT_SETTINGS, { promptInView: true });
+		q.internalWrites = 0;
+		q.snapshots = new Map();
+		q.cache = null;
+		q.cacheKey = null;
+		q.invalidateCache = () => {};
+		q.refreshViews = () => {};
+		q.snapshotFile = async () => {};
+		let asked = 0;
+		q.askCompletion = async () => {
+			asked += 1;
+			return ask();
+		};
+		q.asked = () => asked;
+		q.app = {
+			vault: {
+				read: async () => st.content,
+				process: async (f, fn) => {
+					const next = fn(st.content);
+					st.content = next;
+					return next;
+				},
+				modify: async (f, c) => {
+					st.content = c;
+				},
+			},
+		};
+		return { q, st };
+	};
+
+	const rawDone = '- [ ] #action 交付方案 📅 2026-10-05';
+	const { q, st } = mkPlugin(`${rawDone}\n`, () => ({ note: '搞定', when: new Date('2026-10-01T09:30') }));
+	stub.Notice.last = null;
+	await q.setTaskStatus(
+		{ file: { path: '会议/2026-09-10-示例会议 A.md', basename: '2026-09-10-示例会议 A' }, lineNumber: 0, rawLine: rawDone, indent: '', description: '交付方案' },
+		W.STATUS.DONE,
+	);
+	ok('弹窗被调用一次', q.asked() === 1, String(q.asked()));
+	ok('任务行 ✅ 用所选日期', st.content.includes('✅ 2026-10-01'), st.content);
+	ok('任务行只有一个 ✅ 且日期为所选日',
+		/- \[x\] #action 交付方案 📅 2026-10-05 ✅ 2026-10-01$/m.test(st.content), st.content);
+	ok('子行用所选时间（精确到分）', st.content.includes('✅ 2026-10-01 09:30 完成情况：搞定'), st.content);
+	ok('提示为「已完成并记录」', stub.Notice.last === '任务已完成，并记录了完成情况', String(stub.Notice.last));
+	ok('自定义时间后计数器归零', q.internalWrites === 0, String(q.internalWrites));
+
+	// 取消（null）：一个字都不写
+	const { q: q2, st: st2 } = mkPlugin(`${rawDone}\n`, () => null);
+	stub.Notice.last = null;
+	await q2.setTaskStatus(
+		{ file: { path: '会议/2026-09-10-示例会议 A.md', basename: '示例' }, lineNumber: 0, rawLine: rawDone, indent: '', description: '交付方案' },
+		W.STATUS.DONE,
+	);
+	ok('取消时不写盘', st2.content === `${rawDone}\n`, JSON.stringify(st2.content));
+	ok('取消时提示「任务未完成」', stub.Notice.last === '已取消，任务未完成', String(stub.Notice.last));
+
 	/* ================= 汇总 ================= */
 	console.log(`\n${'='.repeat(48)}`);
 	if (fail) {

@@ -124,6 +124,14 @@ function formatDateTime(d) {
 	return `${formatDate(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
+/**
+ * `input[type="datetime-local"]` 的值（'YYYY-MM-DDTHH:mm'，本地时区、不带秒）。
+ * 与 formatDateTime 同源，保证「弹窗默认值 → 读回 Date → 写进笔记」三者精确到分一致。
+ */
+function localDateTimeInputValue(d) {
+	return formatDateTime(d || new Date()).replace(' ', 'T');
+}
+
 function monthKey(d) {
 	return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
 }
@@ -1196,6 +1204,8 @@ class CompletionModal extends Modal {
 	constructor(app, opts) {
 		super(app);
 		this.opts = opts || {};
+		// 弹窗打开时刻：既是时间控件的默认值，也是控件被清空/写坏时的回退值
+		this.defaultWhen = this.opts.when instanceof Date ? this.opts.when : new Date();
 		this.result = null;
 		this.settled = false;
 		this._resolve = null;
@@ -1216,6 +1226,19 @@ class CompletionModal extends Modal {
 		this.close();
 	}
 
+	/** 读取时间控件；为空或非法（手输坏值）时回退到弹窗打开时刻 */
+	_readWhen() {
+		const raw = this.datetimeInput ? this.datetimeInput.value : '';
+		const parsed = raw ? new Date(raw) : null;
+		if (!parsed || isNaN(parsed.getTime())) return this.defaultWhen;
+		return parsed;
+	}
+
+	/** 确认完成时统一打包：完成情况文本 + 所选完成时间 */
+	_result() {
+		return { note: this.textarea.value, when: this._readWhen() };
+	}
+
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
@@ -1228,7 +1251,14 @@ class CompletionModal extends Modal {
 		});
 
 		const meta = contentEl.createDiv({ cls: 'wb-modal-meta' });
-		meta.createSpan({ text: `完成时间：${this.opts.when || ''}` });
+		meta.createSpan({ text: '完成时间：' });
+		// 可自定义完成时间（默认弹窗打开的那一刻）：✅ 完成日期与完成情况子行都按这里写
+		this.datetimeInput = meta.createEl('input', {
+			type: 'datetime-local',
+			cls: 'wb-modal-datetime',
+			attr: { 'aria-label': '完成时间' },
+		});
+		this.datetimeInput.value = localDateTimeInputValue(this.defaultWhen);
 		if (this.opts.source) meta.createSpan({ text: `来源：${this.opts.source}` });
 
 		const presets = this.opts.presets || [];
@@ -1260,12 +1290,12 @@ class CompletionModal extends Modal {
 		cancel.addEventListener('click', () => this._settle(null));
 
 		const save = btns.createEl('button', { text: '确认完成', cls: 'mod-cta' });
-		save.addEventListener('click', () => this._settle(this.textarea.value));
+		save.addEventListener('click', () => this._settle(this._result()));
 
 		const onKey = (e) => {
 			if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
 				e.preventDefault();
-				this._settle(this.textarea.value);
+				this._settle(this._result());
 			}
 		};
 		this.textarea.addEventListener('keydown', onKey);
@@ -3417,10 +3447,10 @@ class WorkbenchPlugin extends Plugin {
 	}
 
 	async handleEditorCompletion(file, task) {
-		const note = await this.askCompletion(task, file.basename);
+		const result = await this.askCompletion(task, file.basename);
 
 		// 在笔记里勾选后点「取消」：还原成勾选前的原始行，不留下半完成状态
-		if (note === null) {
+		if (result === null) {
 			if (!task.prevLine && !task.prevStatus) return;
 			this.internalWrites += 1;
 			try {
@@ -3448,8 +3478,9 @@ class WorkbenchPlugin extends Plugin {
 			}
 			return;
 		}
-		const when = formatDateTime(new Date());
-		const line = buildCompletionNote(task.indent, when, note, this.settings.completionLabel);
+		// 完成子行的时间用弹窗里选定的值（默认是弹窗打开那一刻）；空文本仍照旧写成「（未填写）」
+		const when = formatDateTime(result.when);
+		const line = buildCompletionNote(task.indent, when, result.note, this.settings.completionLabel);
 		this.internalWrites += 1;
 		try {
 			await this.processFile(file, (content) => {
@@ -3468,10 +3499,14 @@ class WorkbenchPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * 弹出「确认完成任务」。
+	 * @returns {Promise<{note: string, when: Date} | null>} 取消/关闭返回 null
+	 */
 	async askCompletion(task, source) {
 		const modal = new CompletionModal(this.app, {
 			description: task.description,
-			when: formatDateTime(new Date()),
+			when: new Date(),
 			source: source || (task.file ? task.file.basename : ''),
 			presets: this.settings.promptPresets,
 		});
@@ -3510,15 +3545,20 @@ class WorkbenchPlugin extends Plugin {
 		const now = new Date();
 
 		// 先确认、后落盘：点「取消」时笔记一个字都不动
-		let note = null;
+		let result = null;
 		if (nextStatus === STATUS.DONE && this.settings.promptInView) {
-			note = await this.askCompletion(task, file.basename);
-			if (note === null) {
+			result = await this.askCompletion(task, file.basename);
+			if (result === null) {
 				new Notice('已取消，任务未完成');
 				this.refreshViews();
 				return;
 			}
 		}
+		// ✅ 完成日期与完成情况子行按用户选定时间写；startDate 那几处仍按系统当前时间
+		const whenAt = result && result.when ? result.when : now;
+		const note = result ? result.note : '';
+		// 只传完成任务时 applyStatusChange 才会用到 doneDate，其余状态传了也不生效
+		const doneDate = formatDate(whenAt);
 
 		this.internalWrites += 1;
 		try {
@@ -3530,7 +3570,7 @@ class WorkbenchPlugin extends Plugin {
 				if (idx === -1) idx = this.findUniqueTaskLine(lines, task.description);
 				if (idx === -1) throw new Error('未找到任务行，文件可能已被改动');
 				lines[idx] = applyStatusChange(lines[idx], nextStatus, {
-					doneDate: formatDate(now),
+					doneDate,
 					// 「未开始」= 开始日期在未来，因此转未开始时必须写一个未来日期（明天）
 					// 「进行中」按设置决定是否记录今天的开始日期
 					startDate:
@@ -3548,7 +3588,7 @@ class WorkbenchPlugin extends Plugin {
 				if (note) {
 					const line = buildCompletionNote(
 						task.indent,
-						formatDateTime(now),
+						formatDateTime(whenAt),
 						note,
 						this.settings.completionLabel,
 					);
@@ -4023,6 +4063,7 @@ module.exports.applyTaskEdits = applyTaskEdits;
 module.exports.dateFromFilename = dateFromFilename;
 module.exports.formatDate = formatDate;
 module.exports.formatDateTime = formatDateTime;
+module.exports.localDateTimeInputValue = localDateTimeInputValue;
 module.exports.monthKey = monthKey;
 module.exports.isInMonth = isInMonth;
 module.exports.inDateRange = inDateRange;
