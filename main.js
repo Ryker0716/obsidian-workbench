@@ -55,6 +55,9 @@ const DONE_SYMBOLS = new Set(['x', 'X']);
 const DOING_SYMBOLS = new Set(['/']);
 const CANCELLED_SYMBOLS = new Set(['-']);
 
+/** 会议清单默认排序：日期新→旧（与历史行为一致）。state 初始化、排序兜底、表头兜底共用一份 */
+const DEFAULT_MEETING_SORT = Object.freeze({ key: 'date', dir: 'desc' });
+
 // 允许任务写在引用块 / callout 里，如 "> - [ ] #action ..."
 const TASK_LINE_RE = /^(\s*(?:>\s?)*)(\s*)([-*+])\s+\[(.)\]\s*(.*)$/;
 const DUE_RE = /📅\s*(\d{4}-\d{2}-\d{2})/;
@@ -94,6 +97,8 @@ const DEFAULT_SETTINGS = {
 	calendarDailyRouting: true,
 	calendarMeetingFolder: '',
 	calendarMeetingTemplate: '',
+	// 工作安排模版：「＋ 新增安排」与 Calendar 落到未来的日期笔记都用它渲染；留空用内置结构
+	planNoteTemplate: '',
 	taskTag: '#action',
 	// 「只看我的」判定用：填自己的姓名/别名（多个用顿号或换行分隔），留空则按钮禁用
 	selfNames: [],
@@ -314,13 +319,32 @@ function completionNoteRe(label) {
 	return new RegExp(`(?:${alts})\\s*[：:]`);
 }
 
-function hasCompletionNoteBelow(lines, taskIndex, label) {
+/**
+ * 「父任务的直属子行」索引。
+ * 完成情况子行只认直属一层：更深层是**嵌套任务自己的**完成记录，
+ * 既不该被父任务撤销时连带删除，也不能让父任务被误判成「已有完成记录」。
+ * 做法：以父任务结构深度为基准，第一个更深的行定出直属层深度；同层收，更深跳过，回到父层即结束。
+ */
+function directChildRows(lines, taskIndex) {
+	const base = structDepth(lines[taskIndex]);
 	const end = findChildBlockEnd(lines, taskIndex);
-	const re = completionNoteRe(label);
+	const rows = [];
+	let childDepth = null;
 	for (let i = taskIndex + 1; i < end; i++) {
-		if (re.test(lines[i])) return true;
+		const l = lines[i];
+		if (isBlankish(l)) break;
+		const d = structDepth(l);
+		if (d <= base) break;
+		// 缩进可能不统一（tab / 空格混用）：取见过的最小更深层作为直属层
+		if (childDepth === null || d < childDepth) childDepth = d;
+		if (d === childDepth) rows.push(i);
 	}
-	return false;
+	return rows;
+}
+
+function hasCompletionNoteBelow(lines, taskIndex, label) {
+	const re = completionNoteRe(label);
+	return directChildRows(lines, taskIndex).some((i) => re.test(lines[i]));
 }
 
 function buildCompletionNote(taskIndent, when, text, label) {
@@ -342,15 +366,17 @@ function insertAfterTaskBlock(lines, taskIndex, newLine) {
 
 /** 撤销完成时，清掉本插件自动写入的完成情况子行，避免残留旧结论、并让再次完成能重新询问 */
 function removeCompletionNotes(lines, taskIndex, label) {
-	const end = findChildBlockEnd(lines, taskIndex);
 	const re = completionNoteRe(label);
+	// 只删**直属**子行：嵌套任务自己的「完成情况」不算父任务的（曾把子任务的记录一起删掉）
+	const drop = new Set(
+		directChildRows(lines, taskIndex).filter(
+			(i) => re.test(lines[i]) && /^[\s>]*[-*+]\s*✅/.test(lines[i]),
+		),
+	);
+	if (!drop.size) return lines.slice();
 	const out = [];
 	for (let i = 0; i < lines.length; i++) {
-		if (i > taskIndex && i < end) {
-			const l = lines[i];
-			if (re.test(l) && /^[\s>]*[-*+]\s*✅/.test(l)) continue;
-		}
-		out.push(lines[i]);
+		if (!drop.has(i)) out.push(lines[i]);
 	}
 	return out;
 }
@@ -880,7 +906,7 @@ function compareMeetingsByDateDesc(a, b) {
  *   - 计数相等时用日期降序兜底（compareMeetingsByDateDesc 同款语义）。
  */
 function sortMeetings(items, countsOf, sort) {
-	const s = sort && sort.key ? sort : { key: 'date', dir: 'desc' };
+	const s = sort && sort.key ? sort : DEFAULT_MEETING_SORT;
 	const getCounts = typeof countsOf === 'function' ? countsOf : (m) => (m && m.counts) || {};
 	const dateOf = (m) => (m && m.date ? String(m.date) : '');
 	return (items || []).slice().sort((a, b) => {
@@ -1011,6 +1037,88 @@ function parseArrangement(content, fileName) {
 }
 
 /** 生成一条工作安排笔记的 Markdown */
+/**
+ * 用「工作安排」模版渲染一条新笔记（镜像 renderMeetingTemplate 的思路）。
+ * 只负责把已知信息填进模版，其余结构（分区标题、状态、tags）完全由模版决定；
+ * 没配置模版或读不到时，调用方退回 buildArrangementNote()。
+ */
+function renderArrangementTemplate(template, input) {
+	const opts = input || {};
+	const date = String(opts.date || '');
+	const time = normalizeTime(opts.time) || '';
+	const now = opts.now || new Date();
+	const title = String(opts.title || '').trim() || '未命名安排';
+	const place = String(opts.place || '').trim();
+	const attendees = String(opts.attendees || '').trim();
+	const note = String(opts.note || '').trim();
+	const stamp = `${formatDateTime(now).replace(' ', 'T')}:00+08:00`;
+
+	let text = String(template || '')
+		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DDTHH:mm:ss\+08:00"\)\s*%>/g, stamp)
+		.replace(/<%\s*tp\.date\.now\("YYYY-MM-DD"\)\s*%>/g, date);
+	// 模版里的 modified / date 可能是写死的常量（不是 Templater 语法），必须换成这次生成的值
+	text = text.replace(/^modified:.*$/m, `modified: ${stamp}`);
+	if (date) text = text.replace(/^date:.*$/m, `date: ${date}`);
+	/**
+	 * 时间/地点/参与人：模版裸空（`时间:`）就**保持裸空**——没有值时不写空引号，少一行噪声；
+	 * 有值才写，并按 YAML 规则用双引号转义。模版缺这一行时补在 date 之后，免得用户填的值凭空消失。
+	 */
+	const setFrontmatterValue = (key, value) => {
+		if (!value) return;
+		const re = new RegExp(`^${key}:[ \\t]*.*$`, 'm');
+		if (re.test(text)) {
+			text = text.replace(re, () => `${key}: ${yamlQuote(value)}`);
+			return;
+		}
+		text = text.replace(/^(date:.*)$/m, (m0, dateLine) => `${dateLine}\n${key}: ${yamlQuote(value)}`);
+	};
+	setFrontmatterValue('时间', time);
+	setFrontmatterValue('地点', place);
+	setFrontmatterValue('参与人', attendees);
+
+	const lines = text.split('\n');
+	// H1 标题注入：模版若是「# 1. 🎯 今日重点」这类编号分区结构（没有普通一级标题），
+	// 就在首个编号分区前插一行 `# 标题`；已有普通 H1 就不动它。
+	const hasTitleH1 = lines.some((l) => /^#\s+/.test(l) && !/^#\s+\d+\./.test(l));
+	if (!hasTitleH1) {
+		const titleLine = `# ${title}`;
+		const idx = lines.findIndex((l) => /^#\s+1\./.test(l));
+		if (idx === -1) lines.unshift(titleLine, '');
+		else lines.splice(idx, 0, titleLine, '');
+	}
+	// 要点/准备事项追加到「5. 备注」区的末尾；模版没有这一区就在文末补一节（与内置结构同名）
+	if (note) {
+		const headIdx = lines.findIndex((l) => /^#{1,6}\s+5\.(\s|$)/.test(l));
+		if (headIdx === -1) {
+			while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+			lines.push('', '## 要点 / 准备事项', '', ...note.split('\n'), '');
+		} else {
+			const headLevel = /^#+/.exec(lines[headIdx])[0].length;
+			let end = lines.length;
+			for (let i = headIdx + 1; i < lines.length; i += 1) {
+				const m = /^(#+)\s/.exec(lines[i]);
+				if (m && m[1].length <= headLevel) {
+					end = i;
+					break;
+				}
+			}
+			// 落在该区最后一个非空行之后，保持区内原有排版；
+			// 后面还有章节时沿用原有的空行做分隔，文末则补一个换行结尾
+			let at = end;
+			while (at > headIdx + 1 && !lines[at - 1].trim()) at -= 1;
+			const tail = at < lines.length ? ['', ...note.split('\n')] : ['', ...note.split('\n'), ''];
+			lines.splice(at, 0, ...tail);
+		}
+	}
+	const out = lines.join('\n');
+	// 剩下的 Templater 语法（如 <% tp.file.title %>）不阻断写入，但要让用户知道得自己补
+	if (out.includes('<%')) {
+		console.warn('[workbench] 工作安排模版里还有未识别的 Templater 语法，已原样保留；需要完整 Templater 语义请用 Templater 手动新建');
+	}
+	return out;
+}
+
+/** 兜底：没配置模版、或模版读不到时，用这份内置结构生成工作安排笔记 */
 function buildArrangementNote(input, now) {
 	const when = now || new Date();
 	const date = input.date;
@@ -1094,8 +1202,13 @@ function rewriteArrangementNote(content, input, now) {
 	addIfMissing('时间', `时间: ${yamlQuote(time)}`);
 	addIfMissing('地点', `地点: ${yamlQuote(place)}`);
 	addIfMissing('参与人', `参与人: ${yamlQuote(attendees)}`);
-	// 正文标题
-	out = out.replace(/^#\s+.*$/m, () => `# ${title}`);
+	// 正文标题：旧结构首个 H1 就是标题；新模版正文是 `# 1. 🎯 今日重点 … # 5. 📝 备注`
+	// 这样的编号分区，首个 H1 是分区而非标题——替换会把结构改坏（标题由文件名承载，
+	// nextPlanPath 改名时仍会跟随），所以只认「不是编号分区」的 H1。
+	const firstH1 = /^#\s+.*$/m.exec(out);
+	if (firstH1 && !/^#\s+\d+\./.test(firstH1[0])) {
+		out = out.replace(/^#\s+.*$/m, () => `# ${title}`);
+	}
 	// 安排信息 callout
 	out = out.replace(/^> \*\*时间\*\*：.*$/m, () => `> **时间**：${date}${time ? ` ${time}` : '（未定）'}`);
 	out = out.replace(/^> \*\*地点\*\*：.*$/m, () => `> **地点**：${place}`);
@@ -1157,8 +1270,12 @@ function isUnder(path, folder) {
 function resolveExcludeFolders(settings) {
 	const s = settings || {};
 	const out = (s.excludeFolders || []).filter(Boolean).slice();
-	const tpl = String(s.calendarMeetingTemplate || '').trim().replace(/^\/+/, '');
-	if (tpl && !out.includes(tpl)) out.push(tpl);
+	// 模版文件本身不该被扫成会议/文档：会议模版与工作安排模版都自动排除
+	[String(s.calendarMeetingTemplate || '').trim(), String(s.planNoteTemplate || '').trim()]
+		.map((p) => p.replace(/^\/+/, ''))
+		.forEach((tpl) => {
+			if (tpl && !out.includes(tpl)) out.push(tpl);
+		});
 	return out;
 }
 
@@ -1484,14 +1601,13 @@ class WorkbenchView extends ItemView {
 			rangeStart: null,
 			rangeEnd: null,
 			tab: 'overview',
-			showCancelled: false,
 			planCollapsed: false,
 			upcomingCollapsed: false,
 			// 折叠态存进 state，重渲染（搜索防抖、刷新）后不再被重置
 			meetingsCollapsed: false,
 			pastCollapsed: true,
 			// 会议清单排序：点表头切换键与方向（date 默认新→旧，与历史行为一致）
-			meetingSort: { key: 'date', dir: 'desc' },
+			meetingSort: DEFAULT_MEETING_SORT,
 		};
 	}
 
@@ -1670,6 +1786,9 @@ class WorkbenchView extends ItemView {
 	 * 拉进看板，不受当前「范围」限制——逾期的活儿往往挂在过去的会议里。
 	 */
 	applyOverdue(snapshot) {
+		// 逾期透视是**开关**：不开时看板用全量池。此前装配层漏了这道门，
+		// 无论开关都跑 filterOverdue，导致「已完成」卡恒为 0、三栏里只剩逾期任务。
+		if (!this.state.overdueFilter) return snapshot;
 		return filterOverdue(snapshot, this.state.onlyMine, new Date());
 	}
 
@@ -2462,15 +2581,20 @@ class WorkbenchView extends ItemView {
 			return; // 其他范围不展示会议清单
 		}
 
+		// 逾期透视的 countsOf 每次调用都要重筛一遍逾期任务：过滤/排序/渲染都会用到，
+		// 先按对象引用预取一份，避免 sortMeetings 的比较器里反复求和。
+		const countsCache = new Map(shown.map((m) => [m, countsOf(m)]));
+		const countOf = (m) => (countsCache.has(m) ? countsCache.get(m) : countsOf(m));
+
 		if (sf) {
 			// 选了状态筛选时，会议清单只保留该状态下有任务的会议
-			shown = shown.filter((m) => countsOf(m)[sf] > 0);
+			shown = shown.filter((m) => countOf(m)[sf] > 0);
 		}
 		// 点了某场会议的状态标签：清单只留这一场，方便对照
 		const mf = this.state.meetingFilter;
 		if (mf) shown = shown.filter((m) => m.path === mf);
 		// 排序放过滤之后：表头箭头指示的顺序就是列表顺序；纯函数不改入参
-		shown = sortMeetings(shown, countsOf, this.state.meetingSort);
+		shown = sortMeetings(shown, countOf, this.state.meetingSort);
 
 		const box = root.createDiv({ cls: 'wb-panel wb-meetings' });
 		const head = box.createDiv({ cls: 'wb-panel-head' });
@@ -2502,20 +2626,26 @@ class WorkbenchView extends ItemView {
 
 		// 表头：点「会议」按日期排，点三个计数格按对应状态数量排；再点同一列翻转方向。
 		// 只改 state 再整树重绘（走 this.render，不 invalidateCache——排序不该触发重扫）。
-		const sort = this.state.meetingSort || { key: 'date', dir: 'desc' };
+		const sort = this.state.meetingSort || DEFAULT_MEETING_SORT;
 		const headRow = list.createDiv({ cls: 'wb-meeting-head' });
 		const sortCell = (parent, key, label) => {
 			const active = sort.key === key;
+			// 逾期透视下 done 恒为 0（isOverdueTask 排除已完成）：这一列排序只会退化成日期兜底，
+			// 与其让用户以为「点了没用」，不如直接禁用并说明。
+			const disabled = Boolean(od) && key === 'done';
 			const arrow = active ? (sort.dir === 'asc' ? '↑' : '↓') : '';
 			const cell = parent.createSpan({
-				cls: `wb-sortable${active ? ' is-sorted' : ''}`,
+				cls: `wb-sortable${active ? ' is-sorted' : ''}${disabled ? ' is-disabled' : ''}`,
 				text: `${label}${arrow ? ' ' + arrow : ''}`,
 				attr: {
-					title: active
-						? `当前按「${label}」${sort.dir === 'asc' ? '升序' : '降序'}，点击切换为${sort.dir === 'asc' ? '降序' : '升序'}`
-						: `按「${label}」${key === 'date' ? '降序（新→旧）' : '降序（多→少）'}排序`,
+					title: disabled
+						? '逾期透视下没有已完成任务'
+						: active
+							? `当前按「${label}」${sort.dir === 'asc' ? '升序' : '降序'}，点击切换为${sort.dir === 'asc' ? '降序' : '升序'}`
+							: `按「${label}」${key === 'date' ? '降序（新→旧）' : '降序（多→少）'}排序`,
 				},
 			});
+			if (disabled) return;
 			cell.addEventListener('click', () => {
 				// 换列：用该列默认方向（日期新→旧、计数多→少）；同列：翻转
 				const dir = active ? (sort.dir === 'asc' ? 'desc' : 'asc') : 'desc';
@@ -2540,7 +2670,7 @@ class WorkbenchView extends ItemView {
 				this.plugin.openFile(m.file);
 			});
 			const counts = row.createDiv({ cls: 'wb-meeting-counts' });
-			const mc = countsOf(m);
+			const mc = countOf(m);
 			[
 				['todo', 'wb-dot-todo'],
 				['doing', 'wb-dot-doing'],
@@ -2669,6 +2799,14 @@ class WorkbenchView extends ItemView {
 
 	renderCard(parent, task) {
 		const card = parent.createDiv({ cls: 'wb-card' });
+		// 在途（完成询问框还开着）时，把这张卡片的按钮与复选框一起禁掉：
+		// 否则用户能在弹窗挂起期间点「取消任务」，两次写入互相覆盖、Notice 也自相矛盾。
+		// 重渲染会整体换掉 DOM，所以解锁前先看节点是否还在文档里（isConnected）。
+		const lockCard = (locked) => {
+			card.querySelectorAll('button, input[type="checkbox"]').forEach((el) => {
+				el.disabled = locked;
+			});
+		};
 
 		// 勾选框：与笔记里的 - [ ] 一致，勾上即完成（走完成时间 + 完成情况询问），取消勾选即撤销完成
 		const head = card.createDiv({ cls: 'wb-card-head' });
@@ -2686,11 +2824,12 @@ class WorkbenchView extends ItemView {
 		cb.addEventListener('click', async (e) => {
 			e.preventDefault();
 			e.stopPropagation();
-			cb.disabled = true;
+			if (this.plugin.isTaskPending(task)) return;
+			lockCard(true);
 			try {
 				await this.plugin.setTaskStatus(task, isDone ? STATUS.DOING : STATUS.DONE);
 			} finally {
-				cb.disabled = false;
+				if (card.isConnected) lockCard(false);
 			}
 		});
 
@@ -2743,11 +2882,12 @@ class WorkbenchView extends ItemView {
 			b.addEventListener('click', async (e) => {
 				e.preventDefault();
 				e.stopPropagation();
-				b.disabled = true;
+				if (this.plugin.isTaskPending(task)) return;
+				lockCard(true);
 				try {
 					await this.plugin.setTaskStatus(task, next);
 				} finally {
-					b.disabled = false;
+					if (card.isConnected) lockCard(false);
 				}
 			});
 		};
@@ -2766,6 +2906,9 @@ class WorkbenchView extends ItemView {
 			mk('撤销完成', STATUS.DOING);
 			mk('取消任务', STATUS.CANCELLED, '', cancelTip);
 		}
+
+		// 重渲染时若这条任务仍在途（比如完成询问框还开着），按钮与勾选框先置灰
+		if (this.plugin.isTaskPending(task)) lockCard(true);
 	}
 }
 
@@ -2894,6 +3037,8 @@ class WorkbenchPlugin extends Plugin {
 		this.dailyRoutingBusy = new Set();
 		// modify 事件按文件收集批处理：350ms 单槽防抖会把不同文件改成只剩最后一个
 		this.pendingModifyFiles = new Set();
+		// 任务级在途标记：完成弹窗挂起期间挡住同一条任务的其他状态操作
+		this.pendingTasks = new Set();
 
 		this.registerView(VIEW_TYPE_WORKBENCH, (leaf) => new WorkbenchView(leaf, this));
 
@@ -2933,21 +3078,9 @@ class WorkbenchPlugin extends Plugin {
 
 		// 350ms 内可能改到**不同文件**（批量脚本/同步工具）：单槽防抖只会剩下最后一个，
 		// 所以先把文件收进集合，再由尾沿统一逐个处理。
-		const flushModify = debounce(async () => {
-			const files = [...this.pendingModifyFiles];
-			this.pendingModifyFiles.clear();
-			if (!files.length) return;
-			for (const f of files) {
-				// 单个文件出错不能中断整批（handleModify 自身也有兜底）
-				try {
-					await this.handleModify(f);
-				} catch (e) {
-					console.warn('[workbench] 处理修改失败', f && f.path, e);
-				}
-			}
-			// 整批处理完只重绘一次：逐文件 refreshViews 会做 N 次全量重扫
-			this.refreshViews();
-		}, 350, true);
+		const flushModify = debounce(() => this.flushPendingModifies(), 350, true);
+		// 供 flushPendingModifies 在处理未完成时重新排程（也方便测试单独驱动）
+		this._flushDebounced = flushModify;
 		this.registerEvent(
 			this.app.vault.on('modify', (file) => {
 				if (file instanceof TFile && this.isTracked(file)) {
@@ -3035,8 +3168,15 @@ class WorkbenchPlugin extends Plugin {
 			console.error('[workbench] 设置保存失败', e);
 			return false;
 		}
-		this.invalidateCache();
-		this.refreshViews();
+		// 磁盘写很轻，但 invalidateCache+refreshViews 会触发整库重扫：设置页每个击键都会调到这里，
+		// 所以只对「重扫+重绘」做 300ms 尾沿防抖，避免边输入边全量扫描。
+		if (!this._saveFlush) {
+			this._saveFlush = debounce(() => {
+				this.invalidateCache();
+				this.refreshViews();
+			}, 300, true);
+		}
+		this._saveFlush();
 		return true;
 	}
 
@@ -3111,7 +3251,10 @@ class WorkbenchPlugin extends Plugin {
 				// 今天及以后：Calendar 建的是空文件，直接填成一条普通工作安排
 				const existing = await this.app.vault.read(file);
 				if (!existing.trim()) {
-					await this.app.vault.modify(file, buildDailyNote({ date }));
+					// 与「＋ 新增安排」同一口径：配了模版就走模版渲染
+					const tpl = await this.readPlanTemplate();
+					const daily = tpl ? renderArrangementTemplate(tpl, { date, title: '工作安排' }) : buildDailyNote({ date });
+					await this.app.vault.modify(file, daily);
 					// 「已生成」只在真写入时报：文件已有正文（如后台同步补发）时不弹假成功
 					new Notice(`已生成工作安排：${target.path}`);
 				}
@@ -3166,6 +3309,20 @@ class WorkbenchPlugin extends Plugin {
 		} catch (e) {
 			// 降级用内置结构没问题，但要留痕：否则模版路径写错时用户完全无感
 			console.warn('[workbench] 会议纪要模版读取失败，已用内置结构', path, e);
+			return null;
+		}
+	}
+
+	/** 读取「工作安排」模版；没配置或读不到返回 null（由内置结构兜底） */
+	async readPlanTemplate() {
+		const path = this.settings.planNoteTemplate;
+		if (!path) return null;
+		const f = this.app.vault.getAbstractFileByPath(path);
+		if (!(f instanceof TFile)) return null;
+		try {
+			return await this.app.vault.cachedRead(f);
+		} catch (e) {
+			console.warn('[workbench] 工作安排模版读取失败，已用内置结构', path, e);
 			return null;
 		}
 	}
@@ -3474,6 +3631,38 @@ class WorkbenchPlugin extends Plugin {
 
 	/* ------------------------ 勾选检测 ------------------------ */
 
+	/**
+	 * 处理一批 modify 事件收集到的文件。
+	 * 自写窗口内（internalWrites>0）投递进来的 modify 既不能就地处理、也不能丢：
+	 * 先归队，等写回结束后由下一轮 flush 走正常勾选检测（防抖 350ms，自写通常在毫秒级结束；
+	 * 真观察到自旋再考虑加次数上限，这里不加）。
+	 */
+	async flushPendingModifies() {
+		if (!this.pendingModifyFiles || !this.pendingModifyFiles.size) return;
+		const files = [...this.pendingModifyFiles];
+		this.pendingModifyFiles.clear();
+		let processed = 0;
+		for (const f of files) {
+			if (this.internalWrites > 0) {
+				// 先归队再跳过：否则队列已在上面清空，这个文件就永久漏处理了
+				this.pendingModifyFiles.add(f);
+				continue;
+			}
+			// 单个文件出错不能中断整批（handleModify 自身也有兜底）
+			try {
+				await this.handleModify(f);
+				processed += 1;
+			} catch (e) {
+				console.warn('[workbench] 处理修改失败', f && f.path, e);
+			}
+		}
+		if (this.pendingModifyFiles.size && typeof this._flushDebounced === 'function') {
+			this._flushDebounced();
+		}
+		// 只有真正处理过文件才重绘（整批一次，避免 N 次全量重扫）
+		if (processed > 0) this.refreshViews();
+	}
+
 	async handleModify(file) {
 		if (this.internalWrites > 0) return;
 		const oldLines = this.snapshots.get(file.path);
@@ -3548,6 +3737,7 @@ class WorkbenchPlugin extends Plugin {
 		}
 		// 完成子行的时间用弹窗里选定的值（默认是弹窗打开那一刻）；空文本仍照旧写成「（未填写）」
 		const when = formatDateTime(result.when);
+		const doneDay = formatDate(result.when);
 		const line = buildCompletionNote(task.indent, when, result.note, this.settings.completionLabel);
 		this.internalWrites += 1;
 		try {
@@ -3556,6 +3746,12 @@ class WorkbenchPlugin extends Plugin {
 				let idx = lines.indexOf(task.rawLine);
 				if (idx === -1) idx = lines.findIndex((l, i) => i === task.lineNumber && TASK_LINE_RE.test(l));
 				if (idx === -1) throw new Error('未找到任务行');
+				// 编辑器勾选时任务行的 ✅ 是勾选当天：用户在弹窗改了完成时间的话，行内 ✅ 也要统一，
+				// 否则「行内 ✅ 9-30、子行 10-01 09:30」两边打架。原生勾选不带 ✅、Tasks 插件带 ✅，两种都覆盖。
+				const cur = parseTaskLine(lines[idx], 0, this.settings.taskTag);
+				if (!cur || cur.doneDate !== doneDay) {
+					lines[idx] = applyStatusChange(lines[idx], STATUS.DONE, { doneDate: doneDay });
+				}
 				return insertAfterTaskBlock(lines, idx, line).join('\n');
 			});
 			await this.snapshotFile(file);
@@ -3608,14 +3804,47 @@ class WorkbenchPlugin extends Plugin {
 		return hits.length === 1 ? hits[0] : -1;
 	}
 
+	/**
+	 * 任务级在途键：同一文件、同一行、同一描述视为同一条任务。
+	 * 用途见 pendingTasks：完成询问弹窗挂起期间，同卡片的其它按钮必须让位。
+	 */
+	taskKey(task) {
+		if (!task) return '';
+		const p = task.file && task.file.path ? task.file.path : '';
+		return `${p}#${task.lineNumber}#${task.description}`;
+	}
+
+	isTaskPending(task) {
+		// 防御：实例未必经过 onload（测试桩/半初始化）时视为无在途操作
+		return Boolean(this.pendingTasks) && this.pendingTasks.has(this.taskKey(task));
+	}
+
+	beginTaskOp(task) {
+		if (!this.pendingTasks) this.pendingTasks = new Set();
+		this.pendingTasks.add(this.taskKey(task));
+	}
+
+	endTaskOp(task) {
+		if (this.pendingTasks) this.pendingTasks.delete(this.taskKey(task));
+	}
+
 	async setTaskStatus(task, nextStatus) {
 		const file = task.file;
 		const now = new Date();
 
+		// 同一条任务已有操作在途（例如完成询问框还开着）时，其它状态按钮的点击一律忽略：
+		// 否则「取消任务」会先落盘 [-]，「完成」再覆盖成 [x]，两条 Notice 互相矛盾。
+		if (this.isTaskPending(task)) return;
+
 		// 先确认、后落盘：点「取消」时笔记一个字都不动
 		let result = null;
 		if (nextStatus === STATUS.DONE && this.settings.promptInView) {
-			result = await this.askCompletion(task, file.basename);
+			this.beginTaskOp(task);
+			try {
+				result = await this.askCompletion(task, file.basename);
+			} finally {
+				this.endTaskOp(task);
+			}
 			if (result === null) {
 				new Notice('已取消，任务未完成');
 				this.refreshViews();
@@ -3653,7 +3882,7 @@ class WorkbenchPlugin extends Plugin {
 				}
 				// 已完成：完成子行在**同一次写入**里插好。分两次 processFile 会留下
 				// 「符号已翻成 ✅、子行还没插」的中间态（另一处读到就会误判/丢文字）。
-				if (note) {
+				if ((note || '').trim()) {
 					const line = buildCompletionNote(
 						task.indent,
 						formatDateTime(whenAt),
@@ -3669,7 +3898,8 @@ class WorkbenchPlugin extends Plugin {
 			await this.snapshotFile(file);
 
 			if (nextStatus === STATUS.DONE && this.settings.promptInView) {
-				if (note) {
+				// 空白备注由 buildCompletionNote 写成「（未填写）」，提示也别声称记录了内容
+				if ((note || '').trim()) {
 					new Notice('任务已完成，并记录了完成情况');
 				} else {
 					new Notice('任务已完成');
@@ -3709,7 +3939,9 @@ class WorkbenchPlugin extends Plugin {
 		}
 		let file = null;
 		try {
-			const content = buildArrangementNote(input);
+			// 配了「工作安排模版」就按模版渲染，否则用内置结构
+			const tpl = await this.readPlanTemplate();
+			const content = tpl ? renderArrangementTemplate(tpl, input) : buildArrangementNote(input);
 			file = await this.app.vault.create(path, content);
 			await this.snapshotFile(file);
 			this.invalidateCache();
@@ -3993,6 +4225,19 @@ class WorkbenchSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName('工作安排模版')
+			.setDesc(
+				'「＋ 新增安排」与 Calendar 落到今天的日期笔记用它生成（会替换其中的 Templater 日期语法、' +
+					'填入时间/地点/参与人与要点）。留空则用内置结构。',
+			)
+			.addText((t) =>
+				t.setValue(this.plugin.settings.planNoteTemplate || '').onChange(async (v) => {
+					this.plugin.settings.planNoteTemplate = v.trim();
+					await this.plugin.saveSettings();
+				}),
+			);
+
+		new Setting(containerEl)
 			.setName('排除目录')
 			.setDesc('每行一个；这些目录下的文件不参与扫描。')
 			.addTextArea((t) => {
@@ -4126,6 +4371,7 @@ module.exports.firstFolder = firstFolder;
 module.exports.isSourcePathForScope = isSourcePathForScope;
 module.exports.parseArrangement = parseArrangement;
 module.exports.buildArrangementNote = buildArrangementNote;
+module.exports.renderArrangementTemplate = renderArrangementTemplate;
 module.exports.rewriteArrangementNote = rewriteArrangementNote;
 module.exports.applyTaskEdits = applyTaskEdits;
 module.exports.dateFromFilename = dateFromFilename;
@@ -4156,3 +4402,4 @@ module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.TASK_LINE_RE = TASK_LINE_RE;
 module.exports.compareMeetingsByDateDesc = compareMeetingsByDateDesc;
 module.exports.sortMeetings = sortMeetings;
+module.exports.WorkbenchView = WorkbenchView;

@@ -569,6 +569,14 @@
 	font-weight: 600;
 }
 
+/* 不可排序的列（如逾期透视下的「已完成」）：看着就不是可点的 */
+.wb-meeting-head .wb-sortable.is-disabled,
+.wb-meeting-head .wb-sortable.is-disabled:hover {
+	color: var(--text-faint);
+	cursor: default;
+	text-decoration: none;
+}
+
 .wb-link,
 .wb-src {
 	color: var(--link-color);

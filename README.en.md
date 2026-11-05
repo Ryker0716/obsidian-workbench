@@ -219,6 +219,19 @@ By design, the logic is written as **pure functions that don't depend on Obsidia
 
 ## Changelog
 
+### 1.2.0
+
+- **New: Work-plan note template support.** A new setting, "Work-plan note template" (empty by default, uses the built-in layout). With it set, both "＋ New plan" and Calendar-generated notes for today/future dates render from your Templater template: date placeholders replaced, the H1 title injected, `time/place/attendees` written only when they have a value (empty template fields stay blank), and your note appended to the `# 5.` section. Everything else in the template — such as numbered `# 1. 🎯` sections — is preserved, and the template path is auto-excluded from scans. **"Edit plan" stays compatible with both note shapes** (a numbered `# N.` heading is no longer mistaken for the title).
+- **Fixes (fourth full-scope audit, 16 items):**
+  - High: **the Review board's overdue-lens toggle was never wired into view assembly** (since 1.0.2 the board always filtered to overdue tasks — "Done" always showed 0). Gated at the assembly layer now;
+  - High: **cancelling or un-completing a parent task used to also delete nested sub-tasks' outcome notes**, and `hasCompletionNoteBelow` mistook a sub-task's note for the parent's (skipping the parent's completion prompt). Both now only look at the **direct child rows**;
+  - High: **"Edit plan" used to overwrite the first `# …` line even when it was a numbered section marker** from the new template — such headings are now preserved;
+  - Medium: external file changes arriving during an internal write window are now re-queued instead of dropped; the editor check-off path now writes the same completion date into the task line as the custom time (not merely into the child row); all buttons/checkboxes on a card are disabled while its completion prompt is pending; the "Done" sort column is disabled with an explanation when the overdue lens is active;
+  - Minor: dead `showCancelled` state removed, `DEFAULT_MEETING_SORT` constant factored out, settings saves debounce rescanning, overdue counters precomputed, misleading notice for whitespace-only outcome text fixed.
+- Completion-time semantics pinned: default is the moment the prompt opens (matches when an editor check-off happened), freely editable, invalid input falls back to that default.
+- Test hygiene: removed an always-true assertion and renamed a section that claimed "full scan" without calling the real scanner.
+- `node tests/run.js`: **309 assertions passing** (+60).
+
 ### 1.1.3
 
 - **The meeting list now has a header row, and all four columns are sortable.** A new header above the list reads "会议 ｜ 未开始 ｜ 进行中 ｜ 已完成": click "会议" to sort by date, click any of the three count cells to sort by that status's task count. The active column shows a direction arrow (↑ ascending / ↓ descending) and is highlighted; clicking the same column flips the direction (dates default newest→oldest, counts default most→fewest). The sort state lives in the view state, so it survives re-renders and refreshes; **meetings without a date always sink to the bottom in either direction**, and equal counts fall back to date-descending. No header is rendered for an empty list, and the header folds with the rows in narrow sidebars.

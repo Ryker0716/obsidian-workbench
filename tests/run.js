@@ -175,7 +175,8 @@ ok('排除目录在 folders 档也排除', W.isSourcePathForScope('归档/a.md',
 console.log('\n=== 10. 默认设置全是通用值 ===');
 const D = W.DEFAULT_SETTINGS;
 const allDefaults = JSON.stringify(D);
-ok('默认不含中文字符串（无预置姓名/分类）', !/[\u4e00-\u9fa5]/.test(allDefaults.replace(/[\u4e00-\u9fa5]+设置[\u4e00-\u9fa5]*/g, '')) || true);
+// 原先这里有一条「默认不含中文字符串」的断言，实际带了 `|| true` 兜底、恒真，等于没测，已删除；
+// 默认值确实含中文（如「完成情况」标签），改用下面几条更具体的断言把真正的约束钉住。
 ok('默认不含绝对路径', !/\/(Users|home)\//.test(allDefaults), allDefaults.slice(0, 120));
 ok('默认不含贵族化目录名', !/请填|示例库|我的/.test(allDefaults));
 ok('meetingFolders 默认空', Array.isArray(D.meetingFolders) && D.meetingFolders.length === 0);
@@ -367,8 +368,8 @@ ok('date 用传入日期', /^date: 2026-09-15$/m.test(rendered), rendered.slice(
 ok('占位待办补上 #action', /- \[ \] #action 占位事项/.test(rendered), rendered);
 ok('含 👤 或 📅 的待办行才补标签', rendered.split('\n').every((l) => l.includes('#action') || !/[👤📅]/.test(l)), rendered);
 
-/* ================= 20. 合成库全量扫描 ================= */
-console.log('\n=== 20. 合成库扫描（不依赖真实笔记库）===');
+/* ================= 20. fixture 原始遍历自检（未调用插件 scan） ================= */
+console.log('\n=== 20. fixture 原始遍历自检（未调用插件 scan）===');
 const root = fixture.build();
 function walkFixture(dir, out = []) {
 	for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -397,8 +398,9 @@ for (const d of dirs) {
 		}
 	}
 }
-ok('扫到 5 篇正文（3 会议 + 1 项目 + 1 计划）', files === 5, String(files));
-// 这一节是「原始」遍历（故意含 项目/README.md），排除规则由 20b 验证
+ok('遍历到 5 篇 markdown（会议 2 + 项目 2 + 计划 1）', files === 5, String(files));
+// 这一节是「原始」遍历（故意含 项目/README.md），排除规则由 20b 验证；
+// 插件 scan 的真实来源数是 4 篇（去掉 README），别把这里的 5 当扫描口径。
 ok('扫到 9 条行动项（含 README 示例）', tasks === 9, String(tasks));
 ok('四类状态之和 = 总数',
 	perStatus.todo + perStatus.doing + perStatus.done + perStatus.cancelled === tasks,
@@ -724,6 +726,381 @@ console.log('\n=== 28. 取消任务：setTaskStatus 落盘与提示 ===');
 			W.sortMeetings(meetings, countsOf).map((m) => m.date).join(',') === '2026-10-20,2026-10-05,2026-09-10,',
 			W.sortMeetings(meetings, countsOf).map((m) => m.date).join(','));
 		ok('导出接口包含 sortMeetings', typeof W.sortMeetings === 'function');
+	}
+
+	/* ================= 31. 逾期透视是开关（applyOverdue 门控） ================= */
+	console.log('\n=== 31. 逾期透视门控 ===');
+	{
+		const mkTask = (over) => Object.assign({ status: 'doing', due: null, mine: false }, over);
+		const snap = {
+			tasks: [
+				mkTask({ due: '2026-10-20', description: '逾期的事' }),
+				mkTask({ due: '2026-12-30', description: '未来的事' }),
+				mkTask({ status: 'done', due: '2026-10-01', description: '做完了' }),
+			],
+			hasSelf: false,
+		};
+		snap.allTasks = snap.tasks;
+
+		const v = Object.create(W.WorkbenchView.prototype);
+		v.state = { overdueFilter: false, onlyMine: false };
+		ok('关着时原样返回（同一引用，不窄化）', v.applyOverdue(snap) === snap);
+		ok('关着时三栏仍能看到非逾期任务', v.applyOverdue(snap).tasks.length === 3);
+
+		v.state.overdueFilter = true;
+		const narrowed = v.applyOverdue(snap);
+		ok('打开时只留逾期任务', narrowed.tasks.length === 1 && narrowed.tasks[0].description === '逾期的事',
+			narrowed.tasks.map((t) => t.description));
+		ok('打开时不改动原快照', snap.tasks.length === 3);
+	}
+
+	/* ================= 32. 完成情况子行只认直属层（嵌套不连坐） ================= */
+	console.log('\n=== 32. 完成情况只认直属子行 ===');
+	{
+		const nested = [
+			'- [x] #action 父任务 ✅ 2026-10-01',
+			'\t- ✅ 2026-10-01 10:00 完成情况：父的记录',
+			'\t- [x] #action 子任务 ✅ 2026-10-02',
+			'\t\t- ✅ 2026-10-02 11:00 完成情况：子的记录',
+			'\t- 父直属手写备注',
+			'- [ ] #action 下一个',
+		];
+		const cleaned = W.removeCompletionNotes(nested, 0);
+		const txt = cleaned.join('\n');
+		ok('父的完成子行被删', !txt.includes('完成情况：父的记录'), txt);
+		ok('嵌套子任务的完成子行**活着**', txt.includes('完成情况：子的记录'), txt);
+		ok('父直属手写备注不受影响', txt.includes('父直属手写备注'));
+		ok('子任务行与下一条任务都在', txt.includes('#action 子任务') && txt.includes('#action 下一个'));
+
+		const onlyChild = [
+			'- [x] #action 父任务 ✅ 2026-10-01',
+			'\t- [x] #action 子任务 ✅ 2026-10-02',
+			'\t\t- ✅ 2026-10-02 11:00 完成情况：子的记录',
+		];
+		ok('子任务有记录时不再误判父任务', W.hasCompletionNoteBelow(onlyChild, 0) === false);
+		ok('父任务自己有记录时判定为 true', W.hasCompletionNoteBelow(nested, 0) === true);
+
+		const quoted = [
+			'> - [x] #action 引用块父任务 ✅ 2026-10-01',
+			'> \t- ✅ 2026-10-01 10:00 完成情况：引用块内的记录',
+		];
+		ok('引用块内的直属完成子行可识别', W.hasCompletionNoteBelow(quoted, 0) === true);
+		ok('引用块内的直属完成子行可清理', W.removeCompletionNotes(quoted, 0).length === 1);
+
+		const quotedNested = [
+			'> - [x] #action 引用块父任务 ✅ 2026-10-01',
+			'> \t- [x] #action 引用块子任务 ✅ 2026-10-02',
+			'> \t\t- ✅ 2026-10-02 11:00 完成情况：子的记录',
+		];
+		ok('引用块内嵌套子任务不连坐',
+			W.removeCompletionNotes(quotedNested, 0).join('\n').includes('完成情况：子的记录'));
+	}
+
+	/* ================= 33. 安排改写：编号分区标题不被覆盖 ================= */
+	console.log('\n=== 33. rewriteArrangementNote 的 H1 保护 ===');
+	{
+		const oldStyle = ['---', 'date: 2026-10-01', 'modified: 2026-10-01T00:00:00+08:00', 'tags: [工作安排]', '---', '', '# 旧标题', '', '> **时间**：2026-10-01（未定）'].join('\n');
+		const r1 = W.rewriteArrangementNote(oldStyle, { date: '2026-10-05', title: '新标题', place: 'A', attendees: '张三' });
+		ok('旧结构：H1 被替换成新标题', /^# 新标题$/m.test(r1), r1);
+		ok('旧结构：frontmatter date 已更新', /^date: 2026-10-05$/m.test(r1), r1);
+
+		const newStyle = ['---', 'date: 2026-10-01', 'modified: 2026-10-01T00:00:00+08:00', 'tags: [工作安排]', '---', '', '# 1. 🎯 今日重点', '', '## 事项', '', '# 5. 📝 备注', ''].join('\n');
+		const r2 = W.rewriteArrangementNote(newStyle, { date: '2026-10-05', title: '新标题', place: 'B', attendees: '李四' });
+		ok('新结构：编号分区 H1 原样保留', r2.includes('# 1. 🎯 今日重点'), r2);
+		ok('新结构：没有硬塞一个 # 新标题', !r2.includes('# 新标题'), r2);
+		ok('新结构：末尾分区也未被改动', r2.includes('# 5. 📝 备注'));
+		ok('新结构：frontmatter 仍正常更新', /^date: 2026-10-05$/m.test(r2) && r2.includes('地点: "B"'), r2);
+
+		const noH1 = ['---', 'date: 2026-10-01', 'tags: [工作安排]', '---', '', '正文没有一级标题', ''].join('\n');
+		const r3 = W.rewriteArrangementNote(noH1, { date: '2026-10-06', title: '随便', place: '', attendees: '' });
+		ok('无 H1 时不凭空补标题', !/#\s+随便/.test(r3) && r3.includes('正文没有一级标题'), r3);
+	}
+
+	/* ================= 34. modify 批处理：自写窗口内不丢文件 ================= */
+	console.log('\n=== 34. flushPendingModifies 重排队 ===');
+	{
+		const mkP = () => {
+			const q = Object.create(W.prototype);
+			q.pendingModifyFiles = new Set();
+			q.internalWrites = 0;
+			q.handled = [];
+			q.refreshed = 0;
+			q.rescheduled = 0;
+			q.handleModify = async (f) => { q.handled.push(f.path); };
+			q.refreshViews = () => { q.refreshed += 1; };
+			q._flushDebounced = () => { q.rescheduled += 1; };
+			return q;
+		};
+		const A = { path: '会议/a.md' };
+		const B = { path: '会议/b.md' };
+
+		const q1 = mkP();
+		q1.pendingModifyFiles.add(B);
+		q1.internalWrites = 1; // 自写还没结束
+		await q1.flushPendingModifies();
+		ok('自写中：不处理、先归队', q1.handled.length === 0 && q1.pendingModifyFiles.has(B), JSON.stringify([...q1.pendingModifyFiles]));
+		ok('自写中：重新排程下一轮', q1.rescheduled === 1, String(q1.rescheduled));
+		ok('自写中：全被跳过时不重绘', q1.refreshed === 0, String(q1.refreshed));
+
+		q1.internalWrites = 0; // 自写结束
+		await q1.flushPendingModifies();
+		ok('自写结束后：正常处理排队的文件', q1.handled.join(',') === '会议/b.md', q1.handled.join(','));
+		ok('处理完队列清空', q1.pendingModifyFiles.size === 0);
+		ok('处理过文件才重绘，且只重绘一次', q1.refreshed === 1, String(q1.refreshed));
+
+		const q2 = mkP();
+		q2.pendingModifyFiles.add(A);
+		q2.pendingModifyFiles.add(B);
+		await q2.flushPendingModifies();
+		ok('同批多文件都处理（不吞）', q2.handled.length === 2, q2.handled.join(','));
+		await q2.flushPendingModifies();
+		ok('空队列再调用是 no-op', q2.handled.length === 2);
+	}
+
+	/* ================= 35. 卡片在途锁 + 编辑器路径 ✅ 同口径 + 空白备注 ================= */
+	console.log('\n=== 35. 在途锁 / 编辑器口径 / 空白备注 ===');
+	{
+		const mkP = (content, ask) => {
+			const st = { content, writes: 0, asked: 0 };
+			const q = Object.create(W.prototype);
+			q.settings = Object.assign({}, W.DEFAULT_SETTINGS, { promptInView: true });
+			q.internalWrites = 0;
+			q.pendingTasks = new Set();
+			q.snapshots = new Map();
+			q.cache = null;
+			q.cacheKey = null;
+			q.invalidateCache = () => {};
+			q.refreshViews = () => {};
+			q.snapshotFile = async () => {};
+			q.askCompletion = async () => { st.asked += 1; return ask(); };
+			q.app = {
+				vault: {
+					read: async () => st.content,
+					process: async (f, fn) => {
+						const next = fn(st.content);
+						st.content = next;
+						st.writes += 1;
+						return next;
+					},
+					modify: async (f, c) => { st.content = c; st.writes += 1; },
+				},
+			};
+			return { q, st };
+		};
+		const taskOf = (raw, indent) => ({
+			file: { path: '会议/a.md', basename: 'a' },
+			lineNumber: 0,
+			rawLine: raw,
+			indent: indent || '',
+			description: '某事',
+		});
+
+		// 中-2：编辑器勾选后改了完成时间 → 行内 ✅ 与子行统一
+		const rawEditor = '- [x] #action 某事 📅 2026-10-05 ✅ 2026-10-03';
+		const { q: qe, st: se } = mkP(`${rawEditor}\n`, () => ({ note: '搞定', when: new Date('2026-10-01T09:30') }));
+		await qe.handleEditorCompletion(taskOf(rawEditor), taskOf(rawEditor));
+		ok('编辑器路径：行内 ✅ 改成所选日期', se.content.includes('✅ 2026-10-01'), se.content);
+		ok('编辑器路径：不再残留旧 ✅', !se.content.includes('2026-10-03'), se.content);
+		ok('编辑器路径：子行同一时间', se.content.includes('✅ 2026-10-01 09:30 完成情况：搞定'), se.content);
+		ok('编辑器路径：描述与 📅 原样保留', se.content.includes('#action 某事 📅 2026-10-05'), se.content);
+
+		// 原生勾选不带 ✅ 的情形也要补上
+		const rawNative = '- [x] #action 某事';
+		const { q: qn, st: sn } = mkP(`${rawNative}\n`, () => ({ note: '搞定', when: new Date('2026-10-02T08:00') }));
+		await qn.handleEditorCompletion(taskOf(rawNative), taskOf(rawNative));
+		ok('原生勾选：补上所选日期的 ✅', sn.content.includes('- [x] #action 某事 ✅ 2026-10-02'), sn.content);
+
+		// 中-3：在途时第二次操作被忽略
+		const rawDone = '- [ ] #action 某事 📅 2026-10-05';
+		const { q: qp, st: sp } = mkP(`${rawDone}\n`, () => ({ note: '搞定', when: new Date('2026-10-01T09:30') }));
+		qp.beginTaskOp(taskOf(rawDone));
+		await qp.setTaskStatus(taskOf(rawDone), W.STATUS.CANCELLED);
+		ok('在途时其它状态操作不落盘', sp.writes === 0 && sp.asked === 0, JSON.stringify(sp));
+		ok('在途标记不会被误清', qp.isTaskPending(taskOf(rawDone)) === true);
+		qp.endTaskOp(taskOf(rawDone));
+		await qp.setTaskStatus(taskOf(rawDone), W.STATUS.CANCELLED);
+		ok('解锁后正常执行', sp.writes === 1 && sp.content.includes('- [-]'), sp.content);
+
+		// 低-1：空白备注 → 子行写「（未填写）」，但提示不说「记录了完成情况」
+		const { q: qb, st: sb } = mkP(`${rawDone}\n`, () => ({ note: '   ', when: new Date('2026-10-01T09:30') }));
+		stub.Notice.last = null;
+		await qb.setTaskStatus(taskOf(rawDone), W.STATUS.DONE);
+		ok('空白备注：提示为「任务已完成」', stub.Notice.last === '任务已完成', String(stub.Notice.last));
+		ok('空白备注：不插完成情况子行', !sb.content.includes('完成情况'), sb.content);
+		ok('空白备注：✅ 仍按所选时间写', sb.content.includes('✅ 2026-10-01'), sb.content);
+	}
+
+	/* ================= 36. 工作安排模版渲染（A：读模版渲染） ================= */
+	console.log('\n=== 36. 工作安排模版渲染 ===');
+	{
+		// 仿真实模版：Templater 占位 + 裸空字段 + 五章分区
+		const PLAN_TPL = [
+			'---',
+			'modified: <% tp.date.now("YYYY-MM-DDTHH:mm:ss+08:00") %>',
+			'date: <% tp.date.now("YYYY-MM-DD") %>',
+			'一级分类: 运营',
+			'二级分类: 工作安排',
+			'状态: 进行中',
+			'时间:',
+			'地点:',
+			'参与人:',
+			'tags: []',
+			'---',
+			'',
+			'# 1. 🎯 今日重点',
+			'- ',
+			'',
+			'# 2. ✅ 待办事项',
+			'- [ ] ',
+			'',
+			'# 5. 📝 备注',
+			'- 收获：',
+			'- 明日计划：',
+		].join('\n');
+		const NOW = new Date(2026, 10, 5, 9, 30);
+		const filled = W.renderArrangementTemplate(PLAN_TPL, {
+			date: '2026-11-05',
+			title: '与客户吃饭',
+			time: '09:30',
+			place: 'A"B',
+			attendees: '张三、李四',
+			note: '记得带合同',
+			now: NOW,
+		});
+
+		ok('模版：Templater 日期占位已替换', !filled.includes('<%'), filled.split('\n').slice(0, 6));
+		ok('模版：modified 用本次生成时间', filled.includes('modified: 2026-11-05T09:30:00+08:00'), filled.split('\n')[1]);
+		ok('模版：date 用传入日期', /^date: 2026-11-05$/m.test(filled), filled.split('\n')[2]);
+		ok('模版：H1 标题注入在 # 1. 之前',
+			filled.indexOf('# 与客户吃饭') !== -1 &&
+				filled.indexOf('# 与客户吃饭') < filled.indexOf('# 1. 🎯 今日重点'),
+			filled.slice(0, 260));
+		ok('模版：有值时时间/地点/参与人按 YAML 转义',
+			filled.includes('时间: "09:30"') && filled.includes('地点: "A\\"B"') && filled.includes('参与人: "张三、李四"'),
+			filled.split('\n').filter((l) => /^(时间|地点|参与人):/.test(l)));
+		ok('模版：状态与 tags 依模版（不被插件改写）',
+			filled.includes('状态: 进行中') && filled.includes('tags: []'));
+		ok('模版：要点追加到「5. 备注」区',
+			filled.indexOf('记得带合同') > filled.indexOf('- 明日计划：'),
+			filled.slice(filled.indexOf('# 5.')));
+		ok('模版：分区结构原样保留', filled.includes('# 2. ✅ 待办事项') && filled.includes('- [ ] '));
+
+		const bare = W.renderArrangementTemplate(PLAN_TPL, { date: '2026-11-06', title: '开会', now: NOW });
+		const bareFm = bare.split('\n').filter((l) => /^(时间|地点|参与人):/.test(l));
+		ok('模版：无值时裸空字段保持裸空', bareFm.join('|') === '时间:|地点:|参与人:', bareFm);
+
+		// note 落在中间章节时，不能粘到下一章
+		const midTpl = '# 1. A\n\n# 5. 📝 备注\n- 收获：\n\n# 6. 尾巴\n- x\n';
+		const mid = W.renderArrangementTemplate(midTpl, { date: '2026-11-06', title: 'T', note: '我的要点', now: NOW });
+		ok('模版：note 插在 5 区末尾、6 区之前',
+			mid.indexOf('我的要点') > mid.indexOf('- 收获：') && mid.indexOf('我的要点') < mid.indexOf('# 6. 尾巴'),
+			JSON.stringify(mid));
+
+		const noSec = W.renderArrangementTemplate('# 1. A\n- x\n', { date: '2026-11-06', title: 'T', note: '我的要点', now: NOW });
+		ok('模版：没有备注区时文末补一节',
+			noSec.includes('## 要点 / 准备事项') && noSec.indexOf('我的要点') > noSec.indexOf('## 要点'),
+			JSON.stringify(noSec));
+
+		const noFieldTpl = PLAN_TPL.replace('参与人:\n', '');
+		const added = W.renderArrangementTemplate(noFieldTpl, { date: '2026-11-06', title: 'T', attendees: '王五', now: NOW });
+		ok('模版：字段行缺失时补在 date 之后',
+			/^date: 2026-11-06\n参与人: "王五"$/m.test(added),
+			added.split('\n').slice(0, 8));
+
+		// 残留其它 Templater 语法：不阻断写入，但要在控制台提示
+		const warnBackup = console.warn;
+		const warns = [];
+		console.warn = (...a) => warns.push(a.join(' '));
+		let leftover = null;
+		try {
+			leftover = W.renderArrangementTemplate(PLAN_TPL.replace('tags: []', 'tags: [<% tp.file.title %>]'), {
+				date: '2026-11-06',
+				title: 'T',
+				now: NOW,
+			});
+		} finally {
+			console.warn = warnBackup;
+		}
+		ok('模版：残留 <% 原样保留、不阻断', leftover.includes('<%'), leftover && leftover.split('\n').filter((l) => l.includes('tags')));
+		ok('模版：残留 <% 会 console.warn', warns.some((w) => w.includes('Templater')), warns.length);
+
+		// resolveExcludeFolders：工作安排模版自动排除
+		const ex = W.resolveExcludeFolders({ excludeFolders: [], calendarMeetingTemplate: 'T/meet.md', planNoteTemplate: '/T/plan.md' });
+		ok('排除清单包含会议模版', ex.includes('T/meet.md'), ex);
+		ok('排除清单包含工作安排模版（去掉前导斜杠）', ex.includes('T/plan.md'), ex);
+		ok('未配置模版时不往排除清单塞空串',
+			!W.resolveExcludeFolders({ excludeFolders: [], planNoteTemplate: '' }).includes(''), ex);
+
+		// 空串走内置结构：createArrangement 的两个分支
+		const mkCreate = (tplPath, tplText) => {
+			const created = { path: null, content: null };
+			const q = Object.create(W.prototype);
+			q.settings = Object.assign({}, W.DEFAULT_SETTINGS, { planFolders: ['计划'], planNoteTemplate: tplPath });
+			q.internalWrites = 0;
+			q.pendingTasks = new Set();
+			q.snapshots = new Map();
+			q.cache = null;
+			q.cacheKey = null;
+			q.invalidateCache = () => {};
+			q.refreshViews = () => {};
+			q.snapshotFile = async () => {};
+			q.openFile = () => null;
+			const tplFile = new stub.TFile();
+			tplFile.path = tplPath;
+			q.app = {
+				vault: {
+					// tplText 为空视作「文件不存在」，用来覆盖 readPlanTemplate 的 NotFound 分支
+					getAbstractFileByPath: (p) => (tplText && p === tplPath ? tplFile : null),
+					cachedRead: async () => tplText,
+					create: async (p, c) => {
+						created.path = p;
+						created.content = c;
+						return { path: p, basename: 'x' };
+					},
+				},
+			};
+			return { q, created };
+		};
+
+		const { q: q0, created: c0 } = mkCreate('', '不会用到');
+		await q0.createArrangement({ date: '2026-11-07', title: '内置安排' });
+		ok('未配模版：走内置结构', c0.content.includes('## 会前准备') && !c0.content.includes('# 2. ✅ 待办事项'), c0.content && c0.content.slice(0, 200));
+
+		const { q: q1, created: c1 } = mkCreate('T/plan.md', PLAN_TPL);
+		await q1.createArrangement({ date: '2026-11-08', title: '模版安排', time: '14:00', attendees: '赵六' });
+		ok('配了模版：按模版渲染', c1.content.includes('# 2. ✅ 待办事项') && c1.content.includes('时间: "14:00"'), c1.content && c1.content.slice(0, 240));
+
+		const { q: q2 } = mkCreate('T/missing.md', '');
+		ok('模版文件不存在时 readPlanTemplate 返回 null',
+			(await q2.readPlanTemplate()) === null);
+
+		// Calendar 落位（今天及以后）同样走模版
+		const today = W.formatDate(new Date());
+		const { q: qc } = mkCreate('T/plan.md', PLAN_TPL);
+		const calFile = new stub.TFile();
+		calFile.name = `${today}-工作安排.md`;
+		calFile.path = `计划/${today}-工作安排.md`;
+		calFile.extension = 'md';
+		let calWritten = null;
+		const calTplFile = new stub.TFile();
+		calTplFile.path = 'T/plan.md';
+		qc.settings.calendarMeetingFolder = '';
+		qc.app.vault.getAbstractFileByPath = (p) => {
+			if (p === 'T/plan.md') return calTplFile;
+			if (p === calFile.path) return calFile;
+			return null;
+		};
+		qc.app.vault.read = async () => '';
+		qc.app.vault.modify = async (f, c) => { calWritten = c; };
+		qc.app.fileManager = { renameFile: async () => {} };
+		qc.internalWrites = 0;
+		qc.dailyRoutingBusy = new Set();
+		await qc.handleDailyNoteCreated(calFile);
+		ok('Calendar 计划分支：按模版渲染',
+			typeof calWritten === 'string' && calWritten.includes('# 2. ✅ 待办事项') && !calWritten.includes('<%'),
+			calWritten && calWritten.slice(0, 200));
+		ok('Calendar 计划分支：标题注入为「工作安排」',
+			Boolean(calWritten) && calWritten.includes('# 工作安排'), calWritten && calWritten.slice(0, 120));
 	}
 
 	/* ================= 汇总 ================= */
